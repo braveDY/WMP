@@ -23,3 +23,6 @@
 
 # Documentation
 docs/
+logs/
+output/
+outputs/
