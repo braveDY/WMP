@@ -142,6 +142,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             self.r = r
             self.actor_critic = r.alg.actor_critic.eval()
             self.world_model = r._world_model.eval() if r.enable_world_model else None
+            self.terrain_encoder = r.terrain_encoder.eval() if r.enable_world_model else None
             self.device = r.device
             self.num_envs = env.num_envs
             self.num_actions = r.num_actions
@@ -180,7 +181,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
             self.wm_update_counter += 1
             if self.r.enable_world_model and (self.wm_update_counter % self.wm_update_interval == 0):
-                arrival_terrain_emb = self.actor_critic.encode_policy_observation(obs)
+                arrival_terrain_emb = self.r.encode_terrain(obs)
                 wm_obs = {"prop": prop_obs[:, : self.wm_prop_dim], "is_first": self.wm_is_first}
                 wm_embed = torch.cat((arrival_terrain_emb.detach(), wm_obs["prop"]), dim=-1)
                 wm_action_for_obs = self.wm_action_history[
