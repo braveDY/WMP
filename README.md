@@ -93,9 +93,12 @@ Evaluate a trained model checkpoint in the evaluation environment:
 
 ```bash
 python scripts/rsl_rl/play.py \
-  --task Velocity-Rough-WMP-Play \
-  --num_envs 2 \
-  --checkpoint logs/rsl_rl/unitree_a1_wmp/<RUN_DIR>/model_<ITER>.pt
+      --task Velocity-Rough-WMP-Play \
+      --num_envs 2 \
+      --checkpoint logs/rsl_rl/unitree_a1_wmp/2026-09-19_02-12-01_WMP_A1/model_2000.pt \
+      --livestream 1 \
+      --num_steps 100000 \
+      --real-time
 ```
 
 ---
