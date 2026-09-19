@@ -366,8 +366,12 @@ class WMPRunner:
             value = self.cfg.get(key)
             if value is not None:
                 setattr(self.wm_config, key.removeprefix("wm_"), value)
-        self.wm_config.barlow_loss_scale = float(self.wm_config.barlow_loss_scale)
-        self.wm_config.barlow_lambd = float(self.wm_config.barlow_lambd)
+        self.wm_config.barlow_loss_scale = float(
+            getattr(self.wm_config, "barlow_loss_scale", 0.0)
+        )
+        self.wm_config.barlow_lambd = float(
+            getattr(self.wm_config, "barlow_lambd", 5e-4)
+        )
         
         self.wm_config.num_actions = self.num_actions * self.wm_update_interval
         self.wm_config.device = self.device
