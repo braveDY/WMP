@@ -1354,18 +1354,17 @@ class WMPRunner:
         )
 
         def format_time_hours(seconds):
-            hours = seconds / 3600.0
             h = int(seconds // 3600)
             m = int((seconds % 3600) // 60)
             if h >= 24:
                 d = h // 24
                 rem_h = h % 24
-                return f"{hours:.2f}h ({d}d {rem_h}h {m}m)"
+                return f"{d}d {rem_h}h {m}m"
             elif h > 0:
-                return f"{hours:.2f}h ({h}h {m}m)"
+                return f"{h}h {m}m"
             else:
                 s = int(seconds % 60)
-                return f"{hours:.2f}h ({m}m {s}s)"
+                return f"{m}m {s}s"
 
         log_string += ep_string
         log_string += (f"""{'-' * width}\n"""
