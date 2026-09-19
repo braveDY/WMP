@@ -1,2 +1,3 @@
-from .amp_ppo import AMPPPO 
-from .ppo import PPO
+from .amp_ppo import AMPPPO
+
+__all__ = ["AMPPPO"]

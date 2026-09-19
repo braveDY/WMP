@@ -39,7 +39,7 @@ from torch.utils.tensorboard import SummaryWriter
 import pathlib
 import yaml
 
-from ..algorithms import AMPPPO, PPO
+from ..algorithms import AMPPPO
 from ..modules import ActorCriticWMP, ActorCriticWMPDeployment
 from ..algorithms.amp_discriminator import AMPDiscriminator
 from ..datasets import IsaacLabAMPLoader
@@ -188,59 +188,56 @@ class WMPRunner:
             **self.policy_cfg
         ).to(self.device)
 
-        # AMP integration (optional, based on config)
-        if self.cfg["algorithm_class_name"] == "AMPPPO":
-            motion_files = self.cfg.get("amp_motion_files", None)
-            if not motion_files:
-                raise ValueError(
-                    "AMPPPO requires at least one AMP motion file. "
-                    "Check runner.amp_motion_files, for example datasets/go2_motions/*."
-                )
-            amp_data = IsaacLabAMPLoader(
-                motion_files=motion_files,
-                device=self.device,
-                time_between_frames=self.dt,
-                preload_transitions=True,
-                num_preload_transitions=self.cfg.get("amp_num_preload_transitions", 10000),
-                motion_fps=self.cfg.get("amp_motion_fps", None),
+        # AMP integration
+        motion_files = self.cfg.get("amp_motion_files", None)
+        if not motion_files:
+            raise ValueError(
+                "AMPPPO requires at least one AMP motion file. "
+                "Check runner.amp_motion_files, for example datasets/mocap_motions/*."
             )
-            self.amp_obs_dim = amp_data.observation_dim
-            env_amp_dim = self.env.get_observations()["amp"].shape[-1] if "amp" in self.env.get_observations() else 30
-            if self.amp_obs_dim != env_amp_dim:
-                raise RuntimeError(
-                    f"AMP expert obs dim ({self.amp_obs_dim}) does not match "
-                    f"environment AMP obs dim ({env_amp_dim})."
-                )
-
-            amp_normalizer = Normalizer(amp_data.observation_dim)
-            amp_reward_coef = self.cfg.get("amp_reward_coef", 1.0)
-            amp_task_reward_lerp = self.cfg.get("amp_task_reward_lerp", 1.0)
-            discriminator = AMPDiscriminator(
-                amp_data.observation_dim * 2,
-                amp_reward_coef=amp_reward_coef,
-                hidden_layer_sizes=self.cfg.get("amp_discr_hidden_dims", [256, 128]),
-                device=self.device,
-                task_reward_lerp=amp_task_reward_lerp,
-            ).to(self.device)
-            print(
-                "[INFO]: AMP enabled: "
-                f"obs_dim={self.amp_obs_dim}, transition_dim={amp_data.observation_dim * 2}, "
-                f"dt={self.dt:.6f}, reward_coef={amp_reward_coef}, "
-                f"task_reward_lerp={amp_task_reward_lerp}"
+        amp_data = IsaacLabAMPLoader(
+            motion_files=motion_files,
+            device=self.device,
+            time_between_frames=self.dt,
+            preload_transitions=True,
+            num_preload_transitions=self.cfg.get("amp_num_preload_transitions", 10000),
+            motion_fps=self.cfg.get("amp_motion_fps", None),
+        )
+        self.amp_obs_dim = amp_data.observation_dim
+        env_amp_dim = self.env.get_observations()["amp"].shape[-1] if "amp" in self.env.get_observations() else 30
+        if self.amp_obs_dim != env_amp_dim:
+            raise RuntimeError(
+                f"AMP expert obs dim ({self.amp_obs_dim}) does not match "
+                f"environment AMP obs dim ({env_amp_dim})."
             )
 
-            min_std = self.cfg.get("min_normalized_std", None)
-            if min_std is not None:
-                min_std = torch.tensor(min_std, device=self.device, dtype=torch.float32)
-            self.alg = AMPPPO(actor_critic, discriminator, 
-                              amp_data, amp_normalizer,
-                              device=self.device,
-                              amp_replay_buffer_size=self.cfg.get("amp_replay_buffer_size", 100000),
-                              amp_grad_penalty_coef=self.cfg.get("amp_grad_penalty_coef", 10.0),
-                              min_std=min_std,
-                              **self.alg_cfg)
-        else:
-            self.alg = PPO(actor_critic, device=self.device, **self.alg_cfg)
+        amp_normalizer = Normalizer(amp_data.observation_dim)
+        amp_reward_coef = self.cfg.get("amp_reward_coef", 1.0)
+        amp_task_reward_lerp = self.cfg.get("amp_task_reward_lerp", 1.0)
+        discriminator = AMPDiscriminator(
+            amp_data.observation_dim * 2,
+            amp_reward_coef=amp_reward_coef,
+            hidden_layer_sizes=self.cfg.get("amp_discr_hidden_dims", [256, 128]),
+            device=self.device,
+            task_reward_lerp=amp_task_reward_lerp,
+        ).to(self.device)
+        print(
+            "[INFO]: AMP enabled: "
+            f"obs_dim={self.amp_obs_dim}, transition_dim={amp_data.observation_dim * 2}, "
+            f"dt={self.dt:.6f}, reward_coef={amp_reward_coef}, "
+            f"task_reward_lerp={amp_task_reward_lerp}"
+        )
+
+        min_std = self.cfg.get("min_normalized_std", None)
+        if min_std is not None:
+            min_std = torch.tensor(min_std, device=self.device, dtype=torch.float32)
+        self.alg = AMPPPO(actor_critic, discriminator, 
+                          amp_data, amp_normalizer,
+                          device=self.device,
+                          amp_replay_buffer_size=self.cfg.get("amp_replay_buffer_size", 100000),
+                          amp_grad_penalty_coef=self.cfg.get("amp_grad_penalty_coef", 10.0),
+                          min_std=min_std,
+                          **self.alg_cfg)
 
         ppo_param_ids = {id(param) for param in self.alg.actor_critic.parameters()}
         wm_param_ids = {id(param) for param in self._world_model.parameters()} if self.enable_world_model else set()
