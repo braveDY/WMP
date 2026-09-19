@@ -89,7 +89,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         resume_path = args_cli.checkpoint
     else:
         load_run = agent_cfg.load_run if agent_cfg.load_run else ".*"
-        load_checkpoint = agent_cfg.load_checkpoint if agent_cfg.load_checkpoint else ".*"
+        load_checkpoint = agent_cfg.load_checkpoint if agent_cfg.load_checkpoint else r"model_.*\.pt"
         resume_path = get_checkpoint_path(log_root_path, load_run, load_checkpoint)
     if hasattr(env_cfg.scene, "terrain"):
         if args_cli.terrain == "flat":
