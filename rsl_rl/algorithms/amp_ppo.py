@@ -151,28 +151,14 @@ class AMPPPO:
         self.actor_critic.train()
         self.discriminator.train()
 
-    def act(self, obs, critic_obs, amp_obs, history, wm_feature, terrain_embedding=None):
+    def act(self, obs, critic_obs, amp_obs, history, wm_feature, **kwargs):
         if self.actor_critic.is_recurrent:
             self.transition.hidden_states = self.actor_critic.get_hidden_states()
         self.transition.history = history
         self.transition.wm_feature = wm_feature.detach()
         aug_obs, aug_critic_obs = obs.detach(), critic_obs.detach()
-        if terrain_embedding is None:
-            terrain_embedding = self.actor_critic.encode_policy_observation(aug_obs)
-        critic_terrain_embedding = (
-            self.actor_critic.encode_critic_observation(aug_critic_obs)
-            if self.actor_critic.is_ame
-            else terrain_embedding
-        )
-        self.transition.actions = self.actor_critic.act(
-            aug_obs, history, wm_feature, terrain_embedding=terrain_embedding
-        ).detach()
-        self.transition.values = self.actor_critic.evaluate(
-            aug_critic_obs,
-            wm_feature,
-            terrain_embedding=terrain_embedding,
-            critic_terrain_embedding=critic_terrain_embedding,
-        ).detach()
+        self.transition.actions = self.actor_critic.act(aug_obs, history, wm_feature).detach()
+        self.transition.values = self.actor_critic.evaluate(aug_critic_obs, wm_feature).detach()
         self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.actor_critic.action_mean.detach()
         self.transition.action_sigma = self.actor_critic.action_std.detach()
@@ -196,18 +182,7 @@ class AMPPPO:
 
     def compute_returns(self, last_obs, last_critic_obs, wm_feature):
         aug_last_critic_obs = last_critic_obs.detach()
-        terrain_embedding = self.actor_critic.encode_policy_observation(last_obs.detach())
-        critic_terrain_embedding = (
-            self.actor_critic.encode_critic_observation(aug_last_critic_obs)
-            if self.actor_critic.is_ame
-            else terrain_embedding
-        )
-        last_values = self.actor_critic.evaluate(
-            aug_last_critic_obs,
-            wm_feature,
-            terrain_embedding=terrain_embedding,
-            critic_terrain_embedding=critic_terrain_embedding,
-        ).detach()
+        last_values = self.actor_critic.evaluate(aug_last_critic_obs, wm_feature).detach()
         self.storage.compute_returns(last_values, self.gamma, self.lam)
 
     def update(self, clear_storage=True):
@@ -266,17 +241,10 @@ class AMPPPO:
 
             aug_obs_batch = obs_batch.detach()
             aug_critic_obs_batch = critic_obs_batch.detach()
-            terrain_embedding = self.actor_critic.encode_policy_observation(aug_obs_batch)
-            critic_terrain_embedding = (
-                self.actor_critic.encode_critic_observation(aug_critic_obs_batch)
-                if self.actor_critic.is_ame
-                else terrain_embedding
-            )
             self.actor_critic.act(
                 aug_obs_batch,
                 history_batch,
                 wm_feature_batch,
-                terrain_embedding=terrain_embedding,
                 masks=masks_batch,
                 hidden_states=hid_states_batch[0],
             )
@@ -284,8 +252,6 @@ class AMPPPO:
             value_batch = self.actor_critic.evaluate(
                 aug_critic_obs_batch,
                 wm_feature_batch,
-                terrain_embedding=terrain_embedding,
-                critic_terrain_embedding=critic_terrain_embedding,
                 masks=masks_batch,
                 hidden_states=hid_states_batch[1],
             )
@@ -333,23 +299,13 @@ class AMPPPO:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
             if self.vel_predict_coef > 0.0:
-                if getattr(self.actor_critic, "uses_estimation", False):
-                    est_token = self.actor_critic.get_estimation_token(history_batch)
-                    predicted_linear_vel = est_token[:, :3]
-                    target_linear_vel = aug_critic_obs_batch[:, :3]
-                    feet_predict_loss = (
-                        est_token[:, 3:] - aug_critic_obs_batch[:, 3:7]
-                    ).pow(2).mean()
-                else:
-                    predicted_linear_vel = self.actor_critic.get_linear_vel(aug_obs_batch, history_batch)
-                    target_linear_vel = aug_critic_obs_batch[
-                        :, self.actor_critic.privileged_dim - 3 : self.actor_critic.privileged_dim
-                    ]
-                    feet_predict_loss = torch.zeros((), device=self.device)
+                predicted_linear_vel = self.actor_critic.get_linear_vel(aug_obs_batch, history_batch)
+                target_linear_vel = aug_critic_obs_batch[
+                    :, self.actor_critic.privileged_dim - 3 : self.actor_critic.privileged_dim
+                ]
                 vel_predict_loss = (predicted_linear_vel - target_linear_vel).pow(2).mean()
             else:
                 vel_predict_loss = torch.zeros((), device=self.device)
-                feet_predict_loss = torch.zeros((), device=self.device)
 
             policy_state, policy_next_state = sample_amp_policy
             expert_state, expert_next_state = sample_amp_expert
@@ -378,7 +334,7 @@ class AMPPPO:
 
             loss = (
                 surrogate_loss
-                + self.vel_predict_coef * (vel_predict_loss + feet_predict_loss)
+                + self.vel_predict_coef * vel_predict_loss
                 + self.value_loss_coef * value_loss
                 - self.entropy_coef * entropy_batch.mean()
                 + amp_loss
@@ -387,9 +343,6 @@ class AMPPPO:
 
             self.optimizer.zero_grad()
             loss.backward()
-            terrain_grad_norm = nn.utils.clip_grad_norm_(
-                self.actor_critic.terrain_encoder.parameters(), float("inf")
-            )
             actor_critic_grad_norm = nn.utils.clip_grad_norm_(
                 self.actor_critic.parameters(), self.max_grad_norm
             )
@@ -405,8 +358,6 @@ class AMPPPO:
             mean_policy_pred += policy_d.mean().item()
             mean_expert_pred += expert_d.mean().item()
             mean_vel_predict_loss += vel_predict_loss.mean().item()
-            mean_feet_predict_loss += feet_predict_loss.mean().item()
-            mean_terrain_encoder_grad_norm += terrain_grad_norm.item()
             mean_actor_critic_grad_norm += actor_critic_grad_norm.item()
             for name, value in policy_diagnostics.items():
                 diagnostic_sums[name] += value.item()
@@ -419,8 +370,6 @@ class AMPPPO:
         mean_policy_pred /= num_updates
         mean_expert_pred /= num_updates
         mean_vel_predict_loss /= num_updates
-        mean_feet_predict_loss /= num_updates
-        self.last_terrain_encoder_grad_norm = mean_terrain_encoder_grad_norm / num_updates
         self.last_diagnostics = {
             name: value / num_updates for name, value in diagnostic_sums.items()
         }

@@ -17,9 +17,9 @@ SAVE_ITERATIONS = 1000
 
 @configclass
 class PPOAlgorithmCfg:
-    """Shared plain-PPO hyperparameters."""
+    """Shared plain-PPO hyperparameters aligned strictly with master LeggedRobotCfgPPO."""
 
-    entropy_coef: float = 0.008
+    entropy_coef: float = 0.01
     value_loss_coef: float = 1.0
     use_clipped_value_loss: bool = True
     clip_param: float = 0.2
@@ -40,26 +40,24 @@ class AMPPPOAlgorithmCfg(PPOAlgorithmCfg):
 
 @configclass
 class WMPPolicyCfg:
-    architecture: str = "wmp"
+    """Policy network configuration aligned strictly with master A1AMPCfgPPO.policy."""
+
     init_noise_std: float = 1.0
     encoder_hidden_dims: list = [256, 128]
     wm_encoder_hidden_dims: list = [64, 64]
-    actor_hidden_dims: list = [512, 256, 128]
+    actor_hidden_dims: list = [256, 128, 64]
     critic_hidden_dims: list = [512, 256, 128]
     latent_dim: int = 35
     wm_latent_dim: int = 32
     activation: str = "elu"
     commands_begin_dim: int = 6
     wm_prop_dim: int = 33
-    terrain_grid_shape: list = [25, 17, 3]
-    terrain_embedding_dim: int = 64
-    terrain_attention_heads: int = 16
-    terrain_cnn_downsample: bool = True
-    terrain_attach_global: bool = False
 
 
 @configclass
 class WMPRunnerSubCfg:
+    """WMP Runner and AMP hyperparameters aligned strictly with master A1AMPCfgPPO.runner."""
+
     enable_world_model: bool = True
     algorithm_class_name: str = "AMPPPO"
     experiment_name: str = EXPERIMENT_NAME
@@ -69,11 +67,11 @@ class WMPRunnerSubCfg:
     num_steps_per_env: int = 24
     wm_update_interval: int = 5
     amp_motion_files: list = MOTION_FILES
-    amp_reward_coef: float = 2.0
-    amp_num_preload_transitions: int = 100000
+    amp_reward_coef: float = 0.01  # master: 0.5 * 0.02
+    amp_num_preload_transitions: int = 2000000  # master: 2000000
     amp_task_reward_lerp: float = 0.3
     amp_discr_hidden_dims: list = [1024, 512]
-    amp_replay_buffer_size: int = 100000
+    amp_replay_buffer_size: int = 1000000  # master: 1000000
     amp_grad_penalty_coef: float = 10.0
     min_normalized_std: list = [0.05, 0.02, 0.05] * 4
 

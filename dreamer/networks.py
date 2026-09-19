@@ -530,7 +530,7 @@ class MultiEncoder(nn.Module):
                 )
             if len(terrain_shape) not in (1, 3):
                 raise ValueError(
-                    f"Cross-attention terrain input must be a flattened AME scan or image-like, got {terrain_shape}."
+                    f"Cross-attention terrain input must be a flattened elevation scan or image-like, got {terrain_shape}."
                 )
             self._cross_attention = CrossAttentionTerrainEncoder(
                 prop_shape,
@@ -612,13 +612,13 @@ class CrossAttentionTerrainEncoder(nn.Module):
         if len(self._terrain_input_shape) == 1:
             if terrain_grid_shape is None:
                 raise ValueError(
-                    "cross_attention_terrain_grid is required for a flattened AME elevation map."
+                    "cross_attention_terrain_grid is required for a flattened elevation map."
                 )
             self._map_scan_dim = tuple(terrain_grid_shape)
         else:
             self._map_scan_dim = self._terrain_input_shape
         if len(self._map_scan_dim) != 3:
-            raise ValueError(f"AME map_scan_dim must be (L, W, coord_dim), got {self._map_scan_dim}.")
+            raise ValueError(f"Terrain map_scan_dim must be (L, W, coord_dim), got {self._map_scan_dim}.")
         self._map_length, self._map_width, input_ch = self._map_scan_dim
         if input_ch != self._coord_dim:
             raise ValueError(
@@ -628,10 +628,10 @@ class CrossAttentionTerrainEncoder(nn.Module):
         if len(self._terrain_input_shape) == 1 and self._terrain_input_shape[0] != expected_flat_dim:
             raise ValueError(
                 f"Flattened elevation-map dim {self._terrain_input_shape[0]} does not match "
-                f"AME map_scan_dim={self._map_scan_dim} ({expected_flat_dim})."
+                f"map_scan_dim={self._map_scan_dim} ({expected_flat_dim})."
             )
 
-        # AME stores a flat (L, W, 3) scan but restores it as (W, L, 3)
+        # Flattened (L, W, 3) scan is restored as (W, L, 3)
         # to preserve the GridPattern spatial ordering.
         h, w = self._map_width, self._map_length
         stride = 2 if cnn_downsample else 1
@@ -683,7 +683,7 @@ class CrossAttentionTerrainEncoder(nn.Module):
             embed_dim=mha_dim, num_heads=num_heads, batch_first=True
         )
         print(
-            f"AME Cross Attention Terrain Encoder: flat_terrain={self._terrain_input_shape}, "
+            f"Cross Attention Terrain Encoder: flat_terrain={self._terrain_input_shape}, "
             f"map_scan_dim={self._map_scan_dim}, prop_embedding_dim={self._prop_dim}, "
             f"MHA dim={mha_dim}, heads={num_heads}, tokens={self._token_count}, "
             f"terrain_cnn_channels=1, coord_concat=True"

@@ -27,6 +27,13 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--terrain",
+    type=str,
+    default="all",
+    choices=["all", "flat", "stair", "slope", "gap", "pit", "rough"],
+    help="Select terrain type to evaluate on: all, flat, stair, slope, gap, pit, rough (matching master play.py).",
+)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -82,7 +89,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         resume_path = args_cli.checkpoint
     else:
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-    print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+    if hasattr(env_cfg.scene, "terrain"):
+        if args_cli.terrain == "flat":
+            env_cfg.scene.terrain.terrain_type = "plane"
+            env_cfg.scene.terrain.terrain_generator = None
+        elif args_cli.terrain != "all" and getattr(env_cfg.scene.terrain, "terrain_generator", None) is not None:
+            tg = env_cfg.scene.terrain.terrain_generator
+            keyword_map = {
+                "stair": "stair",
+                "slope": "slope",
+                "gap": "gap",
+                "pit": "pit",
+                "rough": "rough",
+            }
+            target_kw = keyword_map[args_cli.terrain]
+            matched = {k: v for k, v in tg.sub_terrains.items() if target_kw in k}
+            if matched:
+                tg.sub_terrains = matched
+                for v in tg.sub_terrains.values():
+                    v.proportion = 1.0 / len(tg.sub_terrains)
+            print(f"[INFO]: Selected terrain types: {list(tg.sub_terrains.keys())}")
 
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 

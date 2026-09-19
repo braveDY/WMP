@@ -37,12 +37,11 @@ if str(local_wmp_path) not in sys.path:
 import numpy as np
 
 from isaaclab.terrains import TerrainGenerator
-from wmp.terrains.finetune_terrain_cfg import FINETUNE_ROUGH_TERRAINS_CFG
 from wmp.terrains.terrain_cfg import ROUGH_TERRAINS_CFG
 
 
 def build_config():
-    source_cfg = FINETUNE_ROUGH_TERRAINS_CFG if args_cli.terrain == "finetune" else ROUGH_TERRAINS_CFG
+    source_cfg = ROUGH_TERRAINS_CFG
     cfg = copy.deepcopy(source_cfg)
 
     if args_cli.terrain_name is not None:

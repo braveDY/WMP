@@ -17,12 +17,12 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
+import copy
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab_assets.robots.unitree import UNITREE_A1_CFG
 
 from wmp.terrains.terrain_cfg import ROUGH_TERRAINS_CFG
-from wmp.terrains.finetune_terrain_cfg import FINETUNE_ROUGH_TERRAINS_CFG
 
 from . import mdp
 
@@ -35,12 +35,13 @@ A1_JOINT_NAMES = [".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"]
 
 A1_ROBOT_CFG = UNITREE_A1_CFG.replace(soft_joint_pos_limit_factor=0.9)
 
-HEIGHT_MAP_X_SIZE = 1.2
-HEIGHT_MAP_Y_SIZE = 0.8
-HEIGHT_MAP_RESOLUTION = 0.05
+# Strictly aligned with master (17 x 11 = 187 points)
+HEIGHT_MAP_X_SIZE = 1.6
+HEIGHT_MAP_Y_SIZE = 1.0
+HEIGHT_MAP_RESOLUTION = 0.1
 HEIGHT_MAP_CHANNELS = 3
-HEIGHT_MAP_GRID_ROWS = int(round(HEIGHT_MAP_X_SIZE / HEIGHT_MAP_RESOLUTION)) + 1
-HEIGHT_MAP_GRID_COLS = int(round(HEIGHT_MAP_Y_SIZE / HEIGHT_MAP_RESOLUTION)) + 1
+HEIGHT_MAP_GRID_ROWS = int(round(HEIGHT_MAP_X_SIZE / HEIGHT_MAP_RESOLUTION)) + 1  # 17
+HEIGHT_MAP_GRID_COLS = int(round(HEIGHT_MAP_Y_SIZE / HEIGHT_MAP_RESOLUTION)) + 1  # 11
 
 
 @configclass
@@ -67,9 +68,9 @@ class VelocitySceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = A1_ROBOT_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
     height_scanner = RayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/" + A1_BASE_LINK,
-        offset=RayCasterCfg.OffsetCfg(pos=(0.3, 0.0, 20.0)),
+        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
         ray_alignment="yaw",
-        pattern_cfg=patterns.GridPatternCfg(resolution=0.05, size=[1.2, 0.8]),
+        pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
         debug_vis=False,
         mesh_prim_paths=["/World/ground"],
     )
@@ -105,17 +106,17 @@ class VelocitySceneCfg(InteractiveSceneCfg):
 class CommandsCfg:
     base_velocity = mdp.UniformVelocityCommandCfg(
         asset_name="robot",
-        resampling_time_range=(6.0, 6.0),
+        resampling_time_range=(10.0, 10.0),
         rel_standing_envs=0.0,
         rel_heading_envs=1.0,
         heading_command=True,
         heading_control_stiffness=0.8,
         debug_vis=True,
         ranges=mdp.UniformVelocityCommandCfg.Ranges(
-            lin_vel_x=(0.0, 1.5),
+            lin_vel_x=(0.0, 0.8),
             lin_vel_y=(0.0, 0.0),
             ang_vel_z=(-1.0, 1.0),
-            heading=(-math.pi, math.pi),
+            heading=(0.0, 0.0),
         ),
     )
 
@@ -358,21 +359,17 @@ class CurriculumCfg:
     terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
 
 
-FINETUNE_FLAG = False
-
-
 @configclass
 class UnitreeA1WMPEnvCfg(ManagerBasedRLEnvCfg):
-    only_positive_rewards = False
+    only_positive_rewards = True
     privileged_dim = 3
-    height_dim = HEIGHT_MAP_GRID_ROWS * HEIGHT_MAP_GRID_COLS * HEIGHT_MAP_CHANNELS
+    height_dim = HEIGHT_MAP_GRID_ROWS * HEIGHT_MAP_GRID_COLS  # 17 * 11 = 187
     prop_dim = 48
     wm_prop_dim = 33
     commands_begin_dim = 6
     height_map_grid_rows = HEIGHT_MAP_GRID_ROWS
     height_map_grid_cols = HEIGHT_MAP_GRID_COLS
-    height_map_channels = HEIGHT_MAP_CHANNELS
-    height_map_height_range = 1.2
+    height_map_height_range = 1.0
 
     scene: VelocitySceneCfg = VelocitySceneCfg(num_envs=4096, env_spacing=2.5)
     observations: ObservationsCfg = ObservationsCfg()
@@ -394,10 +391,7 @@ class UnitreeA1WMPEnvCfg(ManagerBasedRLEnvCfg):
         self.scene.height_scanner.update_period = self.decimation * self.sim.dt
         self.scene.contact_forces.update_period = self.sim.dt
         self.scene.terrain.terrain_generator.curriculum = True
-
-        self.scene.terrain.terrain_generator = (
-            FINETUNE_ROUGH_TERRAINS_CFG if FINETUNE_FLAG else ROUGH_TERRAINS_CFG
-        )
+        self.scene.terrain.terrain_generator = copy.deepcopy(ROUGH_TERRAINS_CFG)
 
 
 @configclass
@@ -408,14 +402,14 @@ class UnitreeA1WMPEnvCfg_PLAY(UnitreeA1WMPEnvCfg):
         self.scene.num_envs = 16
         self.scene.env_spacing = 2.5
         self.scene.terrain.max_init_terrain_level = None
-        self.scene.terrain.terrain_generator.num_rows = 4
-        self.scene.terrain.terrain_generator.num_cols = 4
+        self.scene.terrain.terrain_generator.num_rows = 6
+        self.scene.terrain.terrain_generator.num_cols = 6
         self.scene.terrain.terrain_generator.curriculum = False
 
         self.observations.policy.enable_corruption = False
         self.events.push_robot = None
 
-        self.commands.base_velocity.ranges.lin_vel_x = (0.8, 0.8)
+        self.commands.base_velocity.ranges.lin_vel_x = (0.6, 0.6)
         self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
         self.commands.base_velocity.ranges.heading = (0.0, 0.0)

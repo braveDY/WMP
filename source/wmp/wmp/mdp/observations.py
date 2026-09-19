@@ -106,7 +106,7 @@ def elevation_map(
     sensor_cfg: SceneEntityCfg,
     noise: bool = False,
 ) -> torch.Tensor:
-    """Extract flattened [x, y, z] coordinate elevation map in yaw-aligned base frame."""
+    """Extract flattened 1D elevation map (height measurements) in yaw-aligned base frame strictly matching master."""
     sensor: RayCaster = env.scene.sensors[sensor_cfg.name]
     relative_pos_w = sensor.data.ray_hits_w - sensor.data.pos_w.unsqueeze(1)
     sensor_quat = sensor.data.quat_w
@@ -121,6 +121,8 @@ def elevation_map(
     sensor_coords = quat_apply_inverse(sensor_quat, relative_pos_w.reshape(num_envs * num_rays, 3))
     sensor_coords = torch.nan_to_num(sensor_coords.reshape(num_envs, num_rays, 3))
 
+    heights = sensor_coords[..., 2]
+
     if noise:
         if getattr(env, "_elevation_map_offset", None) is None or env._elevation_map_offset.shape != (num_envs, 1):
             env._elevation_map_offset = torch.zeros((num_envs, 1), device=env.device)
@@ -130,9 +132,11 @@ def elevation_map(
                 env._elevation_map_offset[reset_env_ids] = (
                     torch.rand((reset_env_ids.numel(), 1), device=env.device) * 0.1 - 0.05
                 )
-        sensor_coords[..., 2] += torch.randn_like(sensor_coords[..., 2]) * 0.03
-        sensor_coords[..., 2] += env._elevation_map_offset
+        heights += torch.randn_like(heights) * 0.03
+        heights += env._elevation_map_offset
 
-    sensor_coords[..., 2] = torch.clamp(sensor_coords[..., 2], min=-1.2, max=0.0)
-    return sensor_coords.reshape(num_envs, num_rays * 3)
+    # Master: torch.clip(base_z - 0.5 - measured_heights, -1, 1) * obs_scales.height_measurements (5.0)
+    # sensor_coords[..., 2] is already base_z - ground_z
+    heights = torch.clamp(heights, min=-1.0, max=1.0) * 5.0
+    return heights.reshape(num_envs, num_rays)
 

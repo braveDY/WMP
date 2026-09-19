@@ -136,17 +136,10 @@ class PPO:
             old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch, history_batch, wm_feature_batch in generator:
 
 
-                terrain_embedding = self.actor_critic.encode_policy_observation(obs_batch)
-                critic_terrain_embedding = (
-                    self.actor_critic.encode_critic_observation(critic_obs_batch)
-                    if self.actor_critic.is_ame
-                    else terrain_embedding
-                )
                 self.actor_critic.act(
                     obs_batch,
                     history_batch,
                     wm_feature_batch,
-                    terrain_embedding=terrain_embedding,
                     masks=masks_batch,
                     hidden_states=hid_states_batch[0],
                 )
@@ -154,8 +147,6 @@ class PPO:
                 value_batch = self.actor_critic.evaluate(
                     critic_obs_batch,
                     wm_feature_batch,
-                    terrain_embedding=terrain_embedding,
-                    critic_terrain_embedding=critic_terrain_embedding,
                     masks=masks_batch,
                     hidden_states=hid_states_batch[1],
                 )
@@ -178,7 +169,6 @@ class PPO:
                         for param_group in self.optimizer.param_groups:
                             param_group['lr'] = self.learning_rate
 
-
                 # Surrogate loss
                 ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
                 surrogate = -torch.squeeze(advantages_batch) * ratio
@@ -198,33 +188,14 @@ class PPO:
 
                 loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
-                # MGDP-style auxiliary estimation loss: the 7-D estimation token
-                # (3-D lin vel + 4-D foot height) is supervised by the critic
-                # ground truths, which live in the first 7 dims of the critic obs.
-                if self.actor_critic.uses_estimation and self.vel_predict_coef > 0.0:
-                    est_token = self.actor_critic.estimation_token
-                    vel_loss = F.mse_loss(
-                        est_token[:, :3], critic_obs_batch[:, :3].detach()
-                    )
-                    feet_loss = F.mse_loss(
-                        est_token[:, 3:], critic_obs_batch[:, 3:7].detach()
-                    )
-                    loss = loss + self.vel_predict_coef * (vel_loss + feet_loss)
-                    mean_vel_predict_loss += vel_loss.item()
-                    mean_feet_predict_loss += feet_loss.item()
-
                 # Gradient step
                 self.optimizer.zero_grad()
                 loss.backward()
-                terrain_grad_norm = nn.utils.clip_grad_norm_(
-                    self.actor_critic.terrain_encoder.parameters(), float("inf")
-                )
                 nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
                 self.optimizer.step()
 
                 mean_value_loss += value_loss.item()
                 mean_surrogate_loss += surrogate_loss.item()
-                mean_terrain_encoder_grad_norm += terrain_grad_norm.item()
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates

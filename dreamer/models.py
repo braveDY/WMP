@@ -126,7 +126,7 @@ class WorldModel(nn.Module):
 
     def _train(self, data, embed):
         # action (batch_size, batch_length, act_dim)
-        # height_map (batch_size, batch_length, L * W * 3), matching AME elevation_map
+        # height_map (batch_size, batch_length, L * W * 3), matching elevation_map
         # reward (batch_size, batch_length)
         # discount (batch_size, batch_length)
         data = self.preprocess(data)
@@ -347,7 +347,7 @@ class WorldModel(nn.Module):
         return height_loss + extra_loss
 
     def _reshape_height_map(self, height_map):
-        """Restore AME's flattened elevation map to its (W, L, 3) grid."""
+        """Restore flattened elevation map to its (W, L, 3) grid."""
         channels = int(getattr(self._config, "height_map_channels", 3))
         length = int(getattr(self._config, "height_map_grid_rows", 0))
         width = int(getattr(self._config, "height_map_grid_cols", 0))
@@ -356,7 +356,7 @@ class WorldModel(nn.Module):
         expected = length * width * channels
         if expected <= 0 or height_map.shape[-1] != expected:
             raise ValueError(
-                f"Flattened height_map must have {expected} values for AME map_scan_dim "
+                f"Flattened height_map must have {expected} values for map_scan_dim "
                 f"({length}, {width}, {channels}), got {height_map.shape}."
             )
         return height_map.reshape(list(height_map.shape[:-1]) + [width, length, channels])

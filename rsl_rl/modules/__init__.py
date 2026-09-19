@@ -1,1 +1,1 @@
-from .actor_critic_wmp import ActorCriticAMEDeployment, ActorCriticWMP, ActorCriticWMPDeployment
+from .actor_critic_wmp import ActorCriticWMP, ActorCriticWMPDeployment

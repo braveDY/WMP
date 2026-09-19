@@ -40,46 +40,18 @@ import pathlib
 import yaml
 
 from ..algorithms import AMPPPO, PPO
-from ..modules import ActorCriticAMEDeployment, ActorCriticWMP, ActorCriticWMPDeployment
+from ..modules import ActorCriticWMP, ActorCriticWMPDeployment
 from ..algorithms.amp_discriminator import AMPDiscriminator
 from ..datasets import IsaacLabAMPLoader
 from ..utils.utils import Normalizer
 
 # Import Dreamer components
 from dreamer.models import WorldModel
+from dreamer.networks import CrossAttentionTerrainEncoder
+
 
 class WMPRunner:
-    ARCHITECTURE_VERSION = "ppo_groupnorm_attention_policy_base_vel_query_v5"
-    AME_ARCHITECTURE_VERSION = "ame_raw_prop_groupnorm_attention_no_world_model_v4"
-    AME_WM_ARCHITECTURE_VERSION = "ame_raw_prop_groupnorm_terrain_world_model_v4"
-
-    @classmethod
-    def _get_architecture_capabilities(cls, architecture):
-        architecture = str(architecture).lower()
-        versions = {
-            "wmp": cls.ARCHITECTURE_VERSION,
-            "ame": cls.AME_ARCHITECTURE_VERSION,
-            "ame_wm": cls.AME_WM_ARCHITECTURE_VERSION,
-        }
-        if architecture not in versions:
-            raise ValueError(f"Unsupported policy architecture: {architecture!r}")
-        return (
-            architecture in ("ame", "ame_wm"),
-            architecture in ("wmp", "ame_wm"),
-            versions[architecture],
-        )
-
-    @classmethod
-    def _resolve_architecture(cls, architecture, enable_world_model):
-        uses_ame_raw_inputs, uses_world_model_feature, architecture_version = (
-            cls._get_architecture_capabilities(architecture)
-        )
-        if bool(enable_world_model) != uses_world_model_feature:
-            raise ValueError(
-                f"architecture={str(architecture).lower()!r} requires "
-                f"enable_world_model={uses_world_model_feature}."
-            )
-        return uses_ame_raw_inputs, uses_world_model_feature, architecture_version
+    ARCHITECTURE_VERSION = "wmp_world_model_pure_v1"
 
     def __init__(self,
                  env,
@@ -89,7 +61,6 @@ class WMPRunner:
                  history_length=5,
                  ):
 
-    
         cfg_obj = train_cfg
         if not isinstance(train_cfg, dict):
             converted_cfg = None
@@ -124,14 +95,9 @@ class WMPRunner:
         self.env = env
         self.history_length = history_length
         self.enable_world_model = bool(self.cfg.get("enable_world_model", True))
-        self.policy_architecture = str(self.policy_cfg.get("architecture", "wmp")).lower()
-        (
-            self.uses_ame_raw_inputs,
-            self.uses_world_model_feature,
-            self.architecture_version,
-        ) = self._resolve_architecture(
-            self.policy_architecture, self.enable_world_model
-        )
+        self.policy_architecture = "wmp"
+        self.uses_world_model_feature = self.enable_world_model
+        self.architecture_version = self.ARCHITECTURE_VERSION
         
         # Isaac Lab environment properties
         self.num_envs = self.env.num_envs
@@ -159,23 +125,8 @@ class WMPRunner:
         self.commands_begin_dim = int(getattr(self.env.unwrapped.cfg, "commands_begin_dim", self.policy_cfg.get("commands_begin_dim", 6)))
         self.policy_cfg.setdefault("commands_begin_dim", self.commands_begin_dim)
 
-        # MGDP-style estimation head consumes a 4-frame proprio history for AME;
-        # WMP history excludes commands. History is disabled only when AME runs
-        # without the estimation head.
-        self.use_estimation = bool(self.policy_cfg.get("use_estimation", self.uses_ame_raw_inputs))
-        est_history_length = int(self.policy_cfg.get("est_history_length", 4))
-        if self.uses_ame_raw_inputs:
-            if self.use_estimation:
-                self.history_obs_dim = self.prop_dim
-                self.history_length = est_history_length
-            else:
-                self.history_obs_dim = 0
-                self.history_length = 0
-        else:
-            self.history_obs_dim = self.prop_dim - 3
-        self.policy_cfg["use_estimation"] = self.use_estimation
-        self.policy_cfg["est_history_length"] = est_history_length
-        if not self.uses_ame_raw_inputs and (self.commands_begin_dim < 0 or self.commands_begin_dim + 3 > self.prop_dim):
+        self.history_obs_dim = self.prop_dim - 3
+        if self.commands_begin_dim < 0 or self.commands_begin_dim + 3 > self.prop_dim:
             raise ValueError(
                 f"Invalid command slice [{self.commands_begin_dim}:{self.commands_begin_dim + 3}] "
                 f"for prop_dim={self.prop_dim}."
@@ -192,18 +143,9 @@ class WMPRunner:
                 f"got wm_prop_dim={self.wm_prop_dim}."
             )
         self.terrain_query_extra_dim = self.prop_dim - self.wm_prop_dim if self.enable_world_model else 0
-        if self.enable_world_model and self.terrain_query_extra_dim not in (0, self.num_actions, self.num_actions + 3):
-            raise ValueError(
-                f"Expected the terrain query to extend world-model prop by no values, the "
-                f"{self.num_actions} last-action values, or last action plus 3-D base velocity; got "
-                f"excluded dim "
-                f"{self.terrain_query_extra_dim}."
-            )
 
         self.wm_update_interval = self.cfg.get("wm_update_interval", 5) if self.enable_world_model else 1
 
-        # WMP consumes the flattened elevation_map term at the tail of the
-        # policy observation, exactly as the AME policy encoder does.
         self.height_scanner = self.env.unwrapped.scene.sensors.get("height_scanner", None)
         env_cfg = self.env.unwrapped.cfg
         self.height_map_grid_rows = int(getattr(env_cfg, "height_map_grid_rows", 25))
@@ -212,12 +154,6 @@ class WMPRunner:
         self.height_map_height_range = float(getattr(env_cfg, "height_map_height_range", 1.0))
         self.height_map_flat_dim = (
             self.height_map_grid_rows * self.height_map_grid_cols * self.height_map_channels
-        )
-        height_scan_cfg = getattr(getattr(env_cfg.observations, "policy", None), "height_scan", None)
-        self.height_map_noise_enabled = bool(
-            getattr(height_scan_cfg, "params", {}).get("noise", False)
-            if height_scan_cfg is not None
-            else False
         )
         if self.height_dim != self.height_map_flat_dim:
             raise ValueError(
@@ -231,43 +167,7 @@ class WMPRunner:
                 f"num_obs={self.num_obs}, prop_dim={self.prop_dim}, "
                 f"height_dim={self.height_map_flat_dim}."
             )
-        if self.height_scanner is not None:
-            print(
-                f"[INFO]: WMP height map source: PolicyCfg.elevation_map "
-                f"({self.height_scanner.num_rays} rays/env), "
-                f"flat_dim={self.height_map_flat_dim}, "
-                f"AME map_scan_dim=({self.height_map_grid_rows}, "
-                f"{self.height_map_grid_cols}, {self.height_map_channels}), "
-                f"noise={self.height_map_noise_enabled}, "
-                f"policy_prop_dim={self.prop_dim}, wm_prop_dim={self.wm_prop_dim}"
-            )
-        else:
-            raise RuntimeError("WMP requires a RayCaster sensor named 'height_scanner'.")
-        configured_wm_prop_dim = int(self.policy_cfg.get("wm_prop_dim", self.wm_prop_dim))
-        if self.enable_world_model and configured_wm_prop_dim != self.wm_prop_dim:
-            raise ValueError(
-                f"Policy wm_prop_dim={configured_wm_prop_dim} does not match "
-                f"environment wm_prop_dim={self.wm_prop_dim}."
-            )
-        self.policy_cfg["wm_prop_dim"] = self.wm_prop_dim
-        terrain_grid_shape = (
-            self.height_map_grid_rows,
-            self.height_map_grid_cols,
-            self.height_map_channels,
-        )
-        configured_grid_shape = tuple(
-            self.policy_cfg.get("terrain_grid_shape", terrain_grid_shape)
-        )
-        if configured_grid_shape != terrain_grid_shape:
-            raise ValueError(
-                f"Policy terrain_grid_shape={configured_grid_shape} does not match "
-                f"environment grid={terrain_grid_shape}."
-            )
-        self.policy_cfg["terrain_grid_shape"] = terrain_grid_shape
-        self.policy_cfg.setdefault("terrain_embedding_dim", 64)
-        self.policy_cfg.setdefault("terrain_attention_heads", 16)
-        self.policy_cfg.setdefault("terrain_cnn_downsample", True)
-        self.policy_cfg.setdefault("terrain_attach_global", False)
+
         if self.enable_world_model:
             self._build_world_model()
         else:
@@ -277,31 +177,16 @@ class WMPRunner:
 
         self.history_dim = self.history_length * self.history_obs_dim
         
-        actor_critic = ActorCriticWMP(num_actor_obs=self.num_obs,
-                                          num_critic_obs=self.num_privileged_obs,
-                                          num_actions=self.num_actions,
-                                          height_dim=self.height_dim,
-                                          privileged_dim=self.privileged_dim,
-                                          history_dim=self.history_dim,
-                                          wm_feature_dim=self.wm_feature_dim,
-                                          **self.policy_cfg).to(self.device)
-        if actor_critic.terrain_query_prop_dim != self.prop_dim:
-            raise RuntimeError(
-                "Policy terrain-query proprioception size disagrees with the environment: "
-                f"policy={actor_critic.terrain_query_prop_dim}, environment={self.prop_dim}."
-            )
-        if self.uses_ame_raw_inputs and actor_critic.critic_prop_dim != self.num_privileged_obs - self.height_dim:
-            raise RuntimeError(
-                "AME critic proprioception size disagrees with the environment: "
-                f"critic={actor_critic.critic_prop_dim}, environment="
-                f"{self.num_privileged_obs - self.height_dim}."
-            )
-        if self.enable_world_model and actor_critic.terrain_embedding_dim + self.wm_prop_dim != self.wm_embed_size:
-            raise RuntimeError(
-                "Policy terrain embedding and WorldModel embed sizes disagree: "
-                f"terrain={actor_critic.terrain_embedding_dim}, prop={self.wm_prop_dim}, "
-                f"world_model={self.wm_embed_size}."
-            )
+        actor_critic = ActorCriticWMP(
+            num_actor_obs=self.num_obs,
+            num_critic_obs=self.num_privileged_obs,
+            num_actions=self.num_actions,
+            height_dim=self.height_dim,
+            privileged_dim=self.privileged_dim,
+            history_dim=self.history_dim,
+            wm_feature_dim=self.wm_feature_dim,
+            **self.policy_cfg
+        ).to(self.device)
 
         # AMP integration (optional, based on config)
         if self.cfg["algorithm_class_name"] == "AMPPPO":
@@ -397,7 +282,7 @@ class WMPRunner:
         env.ppo_learning_iteration = int(iteration)
 
     def _get_height_map_observation(self, policy_obs: torch.Tensor) -> torch.Tensor:
-        """Return the flattened PolicyCfg.elevation_map term used by AME."""
+        """Return the flattened elevation_map term used by the world model."""
         if policy_obs.shape[-1] < self.height_map_flat_dim:
             raise ValueError(
                 f"Policy observation last dim {policy_obs.shape[-1]} is smaller than "
@@ -527,16 +412,35 @@ class WMPRunner:
         self.wm_config.height_map_channels = self.height_map_channels
         height_map_shape = (self.height_map_flat_dim,)
         obs_shape = {'prop': (self.wm_prop_dim,), 'height_map': height_map_shape}
-        terrain_embed_dim = int(self.policy_cfg["terrain_embedding_dim"])
-        if bool(self.policy_cfg["terrain_attach_global"]):
-            terrain_embed_dim *= 2
-        self.wm_embed_size = self.wm_prop_dim + terrain_embed_dim
+        terrain_embed_dim = int(self.policy_cfg.get("terrain_embedding_dim", 64))
+        terrain_grid_shape = (
+            self.height_map_grid_rows,
+            self.height_map_grid_cols,
+            self.height_map_channels,
+        )
+        self.terrain_encoder = CrossAttentionTerrainEncoder(
+            prop_shape=(self.prop_dim,),
+            terrain_shape=(self.height_dim,),
+            mha_dim=terrain_embed_dim,
+            num_heads=int(self.policy_cfg.get("terrain_attention_heads", 16)),
+            act="SiLU",
+            norm=True,
+            cnn_downsample=True,
+            attach_global=False,
+            terrain_grid_shape=terrain_grid_shape,
+        ).to(self.device)
+        self.wm_embed_size = self.wm_prop_dim + self.terrain_encoder.outdim
 
         self._world_model = WorldModel(
             self.wm_config, obs_shape, embed_size=self.wm_embed_size
         )
         self._world_model = self._world_model.to(self.device)
         self.wm_feature_dim = self.wm_config.dyn_deter
+
+    def encode_terrain(self, observations):
+        query_prop = observations[..., : self.prop_dim]
+        height_map = observations[..., -self.height_dim :]
+        return self.terrain_encoder(query_prop, height_map)
 
     @staticmethod
     def summarize_macro_dones(dones_by_step, update_interval):
@@ -596,22 +500,17 @@ class WMPRunner:
         actor_critic.eval()
         try:
             with torch.inference_mode():
-                embedding = actor_critic.encode_policy_observation(
-                    probe["observations"]
-                ).detach().clone()
                 metrics = {}
                 if self.uses_world_model_feature and probe["wm_feature"].shape[-1] > 0:
                     action_wm = actor_critic.act_inference(
                         probe["observations"],
                         probe["history"],
                         probe["wm_feature"],
-                        terrain_embedding=embedding,
                     )
                     action_zero = actor_critic.act_inference(
                         probe["observations"],
                         probe["history"],
                         torch.zeros_like(probe["wm_feature"]),
-                        terrain_embedding=embedding,
                     )
                     action_delta = action_wm - action_zero
                     wm_encoder_output = actor_critic.wm_feature_encoder(
@@ -629,38 +528,10 @@ class WMPRunner:
                     }
         finally:
             actor_critic.train(was_training)
-        return embedding, metrics
+        return None, metrics
 
     def _probe_representation_after_update(self, probe, embedding_before):
-        if probe is None or embedding_before is None:
-            return {}
-        terrain_encoder = self.alg.actor_critic.terrain_encoder
-        was_training = terrain_encoder.training
-        terrain_encoder.eval()
-        try:
-            with torch.inference_mode():
-                embedding_after = self.alg.actor_critic.encode_policy_observation(
-                    probe["observations"]
-                )
-        finally:
-            terrain_encoder.train(was_training)
-        before_flat = embedding_before.flatten(1)
-        after_flat = embedding_after.flatten(1)
-        cosine = torch.nn.functional.cosine_similarity(
-            before_flat, after_flat, dim=-1, eps=1e-8
-        ).mean()
-        return {
-            "Representation/ppo_embedding_cosine": cosine,
-            "Representation/ppo_embedding_relative_l2": (
-                (after_flat - before_flat).norm(dim=-1)
-                / (before_flat.norm(dim=-1) + 1e-8)
-            ).mean(),
-            "Representation/ppo_embedding_norm_before": before_flat.norm(dim=-1).mean(),
-            "Representation/ppo_embedding_norm_after": after_flat.norm(dim=-1).mean(),
-            "Representation/ppo_embedding_dim_std": embedding_after.std(
-                dim=0, unbiased=False
-            ).mean(),
-        }
+        return {}
 
     @staticmethod
     def _mean_metric_values(metric_values):
@@ -793,12 +664,7 @@ class WMPRunner:
                     is_macro_boundary = (
                         wm_update_counter % self.wm_update_interval == 0
                     )
-                    terrain_embedding = self.alg.actor_critic.encode_policy_observation(
-                        obs
-                    )
                     history = self.trajectory_history.flatten(1)
-                    
-                    # Fix: wmp_obs should not be all zeros
                     wmp_obs = obs.clone() 
                     current_critic_obs = critic_obs
                     if use_amp:
@@ -808,24 +674,16 @@ class WMPRunner:
                             amp_obs,
                             history,
                             wm_feature,
-                            terrain_embedding=terrain_embedding,
                         )
                     else:
                         actions = self.alg.actor_critic.act(
                             wmp_obs,
                             history,
                             wm_feature,
-                            terrain_embedding=terrain_embedding,
                         )
                         values = self.alg.actor_critic.evaluate(
                             current_critic_obs,
                             wm_feature,
-                            terrain_embedding=terrain_embedding,
-                            critic_terrain_embedding=(
-                                self.alg.actor_critic.encode_critic_observation(current_critic_obs)
-                                if self.uses_ame_raw_inputs
-                                else terrain_embedding
-                            ),
                         ).detach()
                         actions_log_prob = self.alg.actor_critic.get_actions_log_prob(actions).detach()
                         action_mean = self.alg.actor_critic.action_mean.detach()
@@ -903,9 +761,7 @@ class WMPRunner:
                             wm_obs["query_extra"] = wm_arrival_obs[
                                 :, self.wm_prop_dim : self.prop_dim
                             ]
-                        arrival_terrain_embedding = self.alg.actor_critic.encode_policy_observation(
-                            wm_arrival_obs
-                        )
+                        arrival_terrain_embedding = self.encode_terrain(wm_arrival_obs)
                         wm_embed = torch.cat(
                             (arrival_terrain_embedding.detach(), wm_obs["prop"]), dim=-1
                         )
@@ -1129,17 +985,9 @@ class WMPRunner:
                 if use_amp:
                     self.alg.compute_returns(obs, critic_obs, wm_feature)
                 else:
-                    last_terrain_embedding = self.alg.actor_critic.encode_policy_observation(obs)
-                    last_critic_terrain_embedding = (
-                        self.alg.actor_critic.encode_critic_observation(critic_obs)
-                        if self.uses_ame_raw_inputs
-                        else last_terrain_embedding
-                    )
                     last_values = self.alg.actor_critic.evaluate(
                         critic_obs,
                         wm_feature,
-                        terrain_embedding=last_terrain_embedding,
-                        critic_terrain_embedding=last_critic_terrain_embedding,
                     ).detach()
                     self.alg.storage.compute_returns(last_values, self.gamma, self.lam)
 
@@ -1249,7 +1097,7 @@ class WMPRunner:
         max_episode_length = getattr(self.env.unwrapped.cfg, "episode_length_steps", 1000)
         wm_sequence_length = int(max_episode_length / self.wm_update_interval) + 3
         self.wm_sequence_length = wm_sequence_length
-        terrain_embedding_dim = self.alg.actor_critic.terrain_embedding_dim
+        terrain_embedding_dim = self.terrain_encoder.outdim
         self.wm_dataset = {
             "terrain_embed": torch.zeros(
                 (self.num_envs, 2, wm_sequence_length, terrain_embedding_dim),
@@ -1541,13 +1389,30 @@ class WMPRunner:
                                f"""{'Mean AMP reward:':>{pad}} {mean_amp_reward:.4f}\n"""
                                f"""{'AMP reward fraction:':>{pad}} {amp_fraction:.3f}\n""")
 
+        eta_seconds = self.tot_time / (locs['it'] + 1) * (
+            locs['num_learning_iterations'] - locs['it']
+        )
+
+        def format_time_hours(seconds):
+            hours = seconds / 3600.0
+            h = int(seconds // 3600)
+            m = int((seconds % 3600) // 60)
+            if h >= 24:
+                d = h // 24
+                rem_h = h % 24
+                return f"{hours:.2f}h ({d}d {rem_h}h {m}m)"
+            elif h > 0:
+                return f"{hours:.2f}h ({h}h {m}m)"
+            else:
+                s = int(seconds % 60)
+                return f"{hours:.2f}h ({m}m {s}s)"
+
         log_string += ep_string
         log_string += (f"""{'-' * width}\n"""
                        f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""
                        f"""{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"""
-                       f"""{'Total time:':>{pad}} {self.tot_time:.2f}s\n"""
-                       f"""{'ETA:':>{pad}} {self.tot_time / (locs['it'] + 1) * (
-                               locs['num_learning_iterations'] - locs['it']):.1f}s\n""")
+                       f"""{'Total time:':>{pad}} {format_time_hours(self.tot_time)}\n"""
+                       f"""{'ETA:':>{pad}} {format_time_hours(eta_seconds)}\n""")
         print(log_string)
 
     def save(self, path, iteration=None):
@@ -1568,6 +1433,7 @@ class WMPRunner:
         }
         if enable_world_model:
             save_dict['world_model_dict'] = self._world_model.state_dict()
+            save_dict['terrain_encoder_dict'] = self.terrain_encoder.state_dict()
         if hasattr(self.alg, "discriminator"):
             save_dict["discriminator_state_dict"] = self.alg.discriminator.state_dict()
         if hasattr(self.alg, "amp_normalizer") and self.alg.amp_normalizer is not None:
@@ -1588,17 +1454,12 @@ class WMPRunner:
         architecture_version = loaded_dict.get('architecture_version')
         expected_architecture = getattr(self, "architecture_version", self.ARCHITECTURE_VERSION)
         enable_world_model = getattr(self, "enable_world_model", True)
-        if architecture_version != expected_architecture:
-            raise RuntimeError(
-                "Checkpoint architecture is incompatible with PPO-owned terrain attention for this runner. "
-                f"Expected {expected_architecture!r}, got {architecture_version!r}. "
-                "Start a fresh run with the new architecture."
-            )
         self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
         if enable_world_model:
-            if 'world_model_dict' not in loaded_dict:
-                raise RuntimeError("WMP checkpoint is missing world_model_dict.")
-            self._world_model.load_state_dict(loaded_dict['world_model_dict'])
+            if 'world_model_dict' in loaded_dict:
+                self._world_model.load_state_dict(loaded_dict['world_model_dict'])
+            if 'terrain_encoder_dict' in loaded_dict:
+                self.terrain_encoder.load_state_dict(loaded_dict['terrain_encoder_dict'])
         self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
         if hasattr(self.alg, "discriminator") and "discriminator_state_dict" in loaded_dict:
             self.alg.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"])
@@ -1654,40 +1515,23 @@ class WMPRunner:
         policy_obs = self.env.get_observations()["policy"]
         example_obs = policy_obs.to(self.device)
         with torch.inference_mode():
-            if self.policy_architecture == "ame":
-                deployment_policy = ActorCriticAMEDeployment(actor_critic).to(self.device).eval()
-                if self.use_estimation:
-                    batch_size = example_obs.shape[0]
-                    example_history = torch.zeros(
-                        (batch_size, self.history_dim), device=self.device, dtype=example_obs.dtype
-                    )
-                    scripted_policy = torch.jit.trace(
-                        deployment_policy, (example_obs, example_history), strict=False
-                    )
-                    input_description = (
-                        f"observations[{self.num_obs}], history[{self.history_dim}]"
-                    )
-                else:
-                    scripted_policy = torch.jit.trace(deployment_policy, example_obs, strict=False)
-                    input_description = f"observations[{self.num_obs}]"
-            else:
-                deployment_policy = ActorCriticWMPDeployment(actor_critic).to(self.device).eval()
-                batch_size = example_obs.shape[0]
-                example_history = torch.zeros(
-                    (batch_size, self.history_dim), device=self.device, dtype=example_obs.dtype
-                )
-                example_wm_feature = torch.zeros(
-                    (batch_size, self.wm_feature_dim), device=self.device, dtype=example_obs.dtype
-                )
-                scripted_policy = torch.jit.trace(
-                    deployment_policy,
-                    (example_obs, example_history, example_wm_feature),
-                    strict=False,
-                )
-                input_description = (
-                    f"observations[{self.num_obs}], history[{self.history_dim}], "
-                    f"wm_feature[{self.wm_feature_dim}]"
-                )
+            deployment_policy = ActorCriticWMPDeployment(actor_critic).to(self.device).eval()
+            batch_size = example_obs.shape[0]
+            example_history = torch.zeros(
+                (batch_size, self.history_dim), device=self.device, dtype=example_obs.dtype
+            )
+            example_wm_feature = torch.zeros(
+                (batch_size, self.wm_feature_dim), device=self.device, dtype=example_obs.dtype
+            )
+            scripted_policy = torch.jit.trace(
+                deployment_policy,
+                (example_obs, example_history, example_wm_feature),
+                strict=False,
+            )
+            input_description = (
+                f"observations[{self.num_obs}], history[{self.history_dim}], "
+                f"wm_feature[{self.wm_feature_dim}]"
+            )
             scripted_policy.save(os.path.join(path, filename))
         print(
             f"[INFO] Exported deployment TorchScript policy to "
