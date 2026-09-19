@@ -601,13 +601,6 @@ class CrossAttentionTerrainEncoder(nn.Module):
         self._mha_dim = mha_dim
         self._cnn_downsample = cnn_downsample
         self._attach_global = attach_global
-        self._coord_dim = 3
-        if mha_dim <= self._coord_dim:
-            raise ValueError(
-                f"cross_attention_dim ({mha_dim}) must be greater than coordinate dim ({self._coord_dim})."
-            )
-        self._cnn_output_dim = mha_dim - self._coord_dim
-        self.outdim = mha_dim + (mha_dim if attach_global else 0)
 
         if len(self._terrain_input_shape) == 1:
             if terrain_grid_shape is None:
@@ -620,10 +613,18 @@ class CrossAttentionTerrainEncoder(nn.Module):
         if len(self._map_scan_dim) != 3:
             raise ValueError(f"Terrain map_scan_dim must be (L, W, coord_dim), got {self._map_scan_dim}.")
         self._map_length, self._map_width, input_ch = self._map_scan_dim
-        if input_ch != self._coord_dim:
+        if input_ch not in (1, 3):
             raise ValueError(
-                f"Cross-attention terrain input must have 3 channels [x, y, height], got {self._map_scan_dim}."
+                f"Cross-attention terrain input channel must be 1 or 3, got {self._map_scan_dim}."
             )
+        self._coord_dim = input_ch
+        if mha_dim <= self._coord_dim:
+            raise ValueError(
+                f"cross_attention_dim ({mha_dim}) must be greater than coordinate dim ({self._coord_dim})."
+            )
+        self._cnn_output_dim = mha_dim - self._coord_dim
+        self.outdim = mha_dim + (mha_dim if attach_global else 0)
+
         expected_flat_dim = int(np.prod(self._map_scan_dim))
         if len(self._terrain_input_shape) == 1 and self._terrain_input_shape[0] != expected_flat_dim:
             raise ValueError(
@@ -703,7 +704,10 @@ class CrossAttentionTerrainEncoder(nn.Module):
             self._map_length,
             self._coord_dim,
         )
-        height = terrain[..., 2:3].permute(0, 3, 1, 2)
+        if self._coord_dim == 1:
+            height = terrain.permute(0, 3, 1, 2)
+        else:
+            height = terrain[..., 2:3].permute(0, 3, 1, 2)
 
         cnn_features = self.map_cnn(height)
         cnn_features = cnn_features.permute(0, 2, 3, 1).reshape(

@@ -226,7 +226,8 @@ class WorldModel(nn.Module):
         metrics["kl"] = to_np(torch.mean(kl_value))
         if "height_map" in data:
             height_map = self._reshape_height_map(data["height_map"])
-            height_channel = 2
+            channels = int(getattr(self._config, "height_map_channels", 1))
+            height_channel = -1 if channels == 1 else 2
             height_values = height_map[..., height_channel]
             metrics["height_map_valid_ratio"] = 1.0
             metrics["height_map_valid_std"] = to_np(torch.std(height_values))
@@ -334,6 +335,11 @@ class WorldModel(nn.Module):
         target = self._reshape_height_map(target)
         assert pred_mean.shape == target.shape, (pred_mean.shape, target.shape)
 
+        channels = int(getattr(self._config, "height_map_channels", 1))
+        if channels == 1:
+            height_error = (pred_mean - target) ** 2
+            return height_error.mean(dim=tuple(range(2, target.ndim)))
+
         height_channel = 2
         pred_height = pred_mean[..., height_channel]
         target_height = target[..., height_channel]
@@ -347,10 +353,10 @@ class WorldModel(nn.Module):
         return height_loss + extra_loss
 
     def _reshape_height_map(self, height_map):
-        """Restore flattened elevation map to its (W, L, 3) grid."""
-        channels = int(getattr(self._config, "height_map_channels", 3))
-        length = int(getattr(self._config, "height_map_grid_rows", 0))
-        width = int(getattr(self._config, "height_map_grid_cols", 0))
+        """Restore flattened elevation map to its (W, L, channels) grid."""
+        channels = int(getattr(self._config, "height_map_channels", 1))
+        length = int(getattr(self._config, "height_map_grid_rows", 17))
+        width = int(getattr(self._config, "height_map_grid_cols", 11))
         if height_map.shape[-1] == channels and height_map.ndim >= 3:
             return height_map
         expected = length * width * channels

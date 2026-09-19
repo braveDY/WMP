@@ -116,9 +116,9 @@ class WMPRunner:
 
         self.height_scanner = self.env.unwrapped.scene.sensors.get("height_scanner", None)
         env_cfg = self.env.unwrapped.cfg
-        self.height_map_grid_rows = int(getattr(env_cfg, "height_map_grid_rows", 25))
-        self.height_map_grid_cols = int(getattr(env_cfg, "height_map_grid_cols", 17))
-        self.height_map_channels = int(getattr(env_cfg, "height_map_channels", 3))
+        self.height_map_grid_rows = int(getattr(env_cfg, "height_map_grid_rows", 17))
+        self.height_map_grid_cols = int(getattr(env_cfg, "height_map_grid_cols", 11))
+        self.height_map_channels = int(getattr(env_cfg, "height_map_channels", 1))
         self.height_map_height_range = float(getattr(env_cfg, "height_map_height_range", 1.0))
         self.height_map_flat_dim = (
             self.height_map_grid_rows * self.height_map_grid_cols * self.height_map_channels

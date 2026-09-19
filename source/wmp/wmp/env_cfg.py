@@ -39,7 +39,7 @@ A1_ROBOT_CFG = UNITREE_A1_CFG.replace(soft_joint_pos_limit_factor=0.9)
 HEIGHT_MAP_X_SIZE = 1.6
 HEIGHT_MAP_Y_SIZE = 1.0
 HEIGHT_MAP_RESOLUTION = 0.1
-HEIGHT_MAP_CHANNELS = 3
+HEIGHT_MAP_CHANNELS = 1
 HEIGHT_MAP_GRID_ROWS = int(round(HEIGHT_MAP_X_SIZE / HEIGHT_MAP_RESOLUTION)) + 1  # 17
 HEIGHT_MAP_GRID_COLS = int(round(HEIGHT_MAP_Y_SIZE / HEIGHT_MAP_RESOLUTION)) + 1  # 11
 
@@ -369,6 +369,7 @@ class UnitreeA1WMPEnvCfg(ManagerBasedRLEnvCfg):
     commands_begin_dim = 6
     height_map_grid_rows = HEIGHT_MAP_GRID_ROWS
     height_map_grid_cols = HEIGHT_MAP_GRID_COLS
+    height_map_channels = HEIGHT_MAP_CHANNELS  # 1
     height_map_height_range = 1.0
 
     scene: VelocitySceneCfg = VelocitySceneCfg(num_envs=4096, env_spacing=2.5)
