@@ -551,13 +551,10 @@ class WMPRunner:
         # A reset has no temporal context.  Repeat the first valid proprioceptive
         # frame instead of exposing zero-padded history as an episode-start token.
         if self.history_length > 0:
-            if not self.uses_ame_raw_inputs:
-                prop_obs = obs[:, : self.prop_dim]
-                obs_without_command[:, : self.commands_begin_dim] = prop_obs[:, : self.commands_begin_dim]
-                obs_without_command[:, self.commands_begin_dim :] = prop_obs[:, self.commands_begin_dim + 3 :]
-                self.trajectory_history[:] = obs_without_command.unsqueeze(1)
-            elif self.use_estimation:
-                self.trajectory_history[:] = obs[:, : self.prop_dim].unsqueeze(1)
+            prop_obs = obs[:, : self.prop_dim]
+            obs_without_command[:, : self.commands_begin_dim] = prop_obs[:, : self.commands_begin_dim]
+            obs_without_command[:, self.commands_begin_dim :] = prop_obs[:, self.commands_begin_dim + 3 :]
+            self.trajectory_history[:] = obs_without_command.unsqueeze(1)
         
         # World model state
         wm_latent = None
@@ -852,18 +849,12 @@ class WMPRunner:
                         self.alg.storage.add_transitions(self.alg.transition)
                     
                     # Update history
-                    if not self.uses_ame_raw_inputs:
-                        prop_obs = obs[:, : self.prop_dim]
-                        obs_without_command[:, : self.commands_begin_dim] = prop_obs[:, : self.commands_begin_dim]
-                        obs_without_command[:, self.commands_begin_dim :] = prop_obs[:, self.commands_begin_dim + 3 :]
-                        self.trajectory_history[:, :-1] = self.trajectory_history[:, 1:].clone()
-                        self.trajectory_history[:, -1] = obs_without_command
-                        reset_history_frame = obs_without_command
-                    elif self.use_estimation:
-                        prop_obs = obs[:, : self.prop_dim]
-                        self.trajectory_history[:, :-1] = self.trajectory_history[:, 1:].clone()
-                        self.trajectory_history[:, -1] = prop_obs
-                        reset_history_frame = prop_obs
+                    prop_obs = obs[:, : self.prop_dim]
+                    obs_without_command[:, : self.commands_begin_dim] = prop_obs[:, : self.commands_begin_dim]
+                    obs_without_command[:, self.commands_begin_dim :] = prop_obs[:, self.commands_begin_dim + 3 :]
+                    self.trajectory_history[:, :-1] = self.trajectory_history[:, 1:].clone()
+                    self.trajectory_history[:, -1] = obs_without_command
+                    reset_history_frame = obs_without_command
                     
                     # Handle resets
                     if has_resets:
