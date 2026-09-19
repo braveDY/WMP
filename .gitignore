@@ -20,3 +20,6 @@
 **/wandb/*
 **/.neptune/*
 *.tmp
+
+# Documentation
+docs/
