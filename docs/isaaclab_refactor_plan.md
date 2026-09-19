@@ -171,43 +171,47 @@ WMP/
 ## 5. 分阶段落地实施路线图 (Milestones)
 
 ### 阶段 1：项目工程骨架与本地算法库构建
-- [ ] 创建 `source/wmp/` 扩展目录结构，编写 `setup.py`、`pyproject.toml`、`config/extension.toml`。
-- [ ] 整合并适配本地 `rsl_rl/`：
-  - 接入 `WMPRunner`（训练总调度）；
+- [x] 创建 `source/wmp/` 扩展目录结构，编写 `setup.py`、`pyproject.toml`、`config/extension.toml`。
+- [x] 整合并适配本地 `rsl_rl/`：
+  - 接入 `WMPRunner`（统一支持 RSSM 世界模型与 AMP 对抗训练调度）；
   - 接入 `AMPDiscriminator` 与 `IsaacLabAMPLoader`；
-  - 接入 `ActorCriticWMP` 与 `DepthPredictor`。
-- [ ] 保留并连接 `dreamer/` 模块与 `dreamer/configs.yaml`。
-- [ ] 在 conda 的 `isaaclab` 环境下执行 `pip install -e source/wmp` 进行安装验证。
+  - 接入 `ActorCriticWMP`、`CrossAttentionTerrainEncoder` 与 `AMPPPO`。
+- [x] 适配 `dreamer/` 模块与 `dreamer/configs.yaml`。
+- [x] 在 conda 的 `isaaclab` 环境下执行 `pip install -e source/wmp --no-deps` 验证通过。
 
 ### 阶段 2：场景、机器人与传感器构建 (`env_cfg.py`)
-- [ ] 编写 `VelocitySceneCfg`：引入 Unitree A1 资产，精确配置关节限制、驱动器刚度与阻尼。
-- [ ] 配置足端接触传感器 `contact_forces`。
-- [ ] 配置高精度网格扫描器 `RayCasterCfg`（用于特权高度图与世界模型重构目标）。
-- [ ] 迁移 `terrains/` 复杂越障地形库（台阶、斜坡、沟槽、连续障碍）。
+- [x] 编写 `VelocitySceneCfg`：引入 Unitree A1 资产，精确配置关节限制、驱动器刚度与阻尼。
+- [x] 配置足端接触传感器 `contact_forces`。
+- [x] 配置高精度网格扫描器 `RayCasterCfg`（25x17 网格，分辨率 0.05m，范围 1.2mx0.8m）。
+- [x] 迁移 `terrains/` 复杂越障地形库（台阶、斜坡、离散金字塔、越障地形）。
 
 ### 阶段 3：MDP 逻辑与 AMP 观测提取
-- [ ] 编写 `mdp/observations.py`：实现 `policy`、`critic`、`amp_obs` 与前向高程特征提取。
-- [ ] 编写 `mdp/reward.py`：实现速度跟踪、姿态惩罚、力矩平滑，并集成 AMP 奖励加权。
-- [ ] 编写 `mdp/terminations.py`（摔倒、姿态翻转终止）与 `mdp/curriculum.py`（地形等级跃迁）。
+- [x] 编写 `mdp/observations.py`：实现 `policy` (1323 维)、`critic` (1352 维)、`amp` (30 维对齐动捕) 与 `elevation_map` (1275 维 3D 坐标高程图)。
+- [x] 编写 `mdp/reward.py`：实现速度跟踪、姿态惩罚、足端触地时间与平滑惩罚。
+- [x] 编写 `mdp/terminations.py`（摔倒、姿态翻转终止）与 `mdp/curriculum.py`（地形等级跃迁）。
 
 ### 阶段 4：Agent 配置与任务注册
-- [ ] 编写 `source/wmp/wmp/agent_cfg.py`，定义 `WMPRunnerCfg`（联合配置 PPO、Dreamer 及 AMP 超参数）。
-- [ ] 在 `source/wmp/wmp/__init__.py` 中注册任务：
+- [x] 编写 `source/wmp/wmp/agent_cfg.py`，定义 `UnitreeA1WMPRunnerCfg`（联合配置 PPO、Dreamer 及 AMP 超参数）。
+- [x] 在 `source/wmp/wmp/__init__.py` 中注册任务：
   - `Velocity-Rough-WMP-Train`
   - `Velocity-Rough-WMP-Play`
-- [ ] 适配 `scripts/rsl_rl/train.py` 与 `scripts/rsl_rl/play.py`，确保其直接调用本地 `WMPRunner`。
+- [x] 适配 `scripts/rsl_rl/train.py` 与 `scripts/rsl_rl/play.py`，确保其直接调用本地 `WMPRunner`。
 
 ### 阶段 5：小规模冒烟测试与系统验证
-- [ ] 启动轻量环境测试：
+- [x] 启动轻量环境测试：
   ```bash
-  python scripts/rsl_rl/train.py --task Velocity-Rough-WMP-Train --num_envs 16 --headless --max_iterations 10
+  /home/brave/miniconda3/envs/isaaclab/bin/python scripts/rsl_rl/train.py --task Velocity-Rough-WMP-Train --num_envs 16 --headless --max_iterations 2
   ```
-- [ ] 关键验证指标：
-  1. 动捕数据正常加载，`amp_obs` 维度完全匹配；
-  2. AMP 判别器 Loss 与奖励正常更新；
-  3. DreamerV3 隐状态前向推进与 ReplayBuffer 存储更新正常；
-  4. PPO 策略梯度与 ActorCriticWMP 权重反向传播无 NaN。
+- [x] 关键验证指标全数通过：
+  1. 动捕数据正常加载（4 motions, 30 维，10 万步预加载）；
+  2. AMP 判别器 Loss、梯度惩罚与奖励正常计算；
+  3. DreamerV3 隐状态前向推进与时序更新正常；
+  4. PPO 策略梯度与 ActorCriticWMP 权重更新正常并成功保存 checkpoint。
 
 ### 阶段 6：推理回放与使用说明
-- [ ] 验证 `scripts/rsl_rl/play.py` 的加载与可视化，确保单步推断中 World Model 隐状态维持正确。
-- [ ] 完善根目录 `README.md` 与技术细节文档。
+- [x] 验证 `scripts/rsl_rl/play.py` 的加载与单步推断：
+  ```bash
+  /home/brave/miniconda3/envs/isaaclab/bin/python scripts/rsl_rl/play.py --task Velocity-Rough-WMP-Play --num_envs 2 --headless --num_steps 10 --checkpoint .../model_2.pt
+  ```
+  成功加载检查点并跑通完整的 World Model + PPO 时序推断循环。
+

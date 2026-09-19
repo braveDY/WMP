@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021 ETH Zurich, Nikita Rudin. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # 
 # Redistribution and use in source and binary forms, with or without
@@ -30,28 +30,31 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 
-from rsl_rl.modules import ActorCritic
-from rsl_rl.storage import RolloutStorage
+from ..modules import ActorCriticWMP
+from ..storage import RolloutStorage
 
 class PPO:
-    actor_critic: ActorCritic
+    actor_critic: ActorCriticWMP
     def __init__(self,
                  actor_critic,
                  num_learning_epochs=1,
                  num_mini_batches=1,
                  clip_param=0.2,
-                 gamma=0.998,
-                 lam=0.95,
-                 value_loss_coef=1.0,
+                 prediction_error_coef=1.0,
+                 vel_predict_coef=1.0,
                  entropy_coef=0.0,
-                 learning_rate=1e-3,
+                 value_loss_coef=1.0,
+                 desired_kl=None,
                  max_grad_norm=1.0,
                  use_clipped_value_loss=True,
                  schedule="fixed",
-                 desired_kl=0.01,
+                 learning_rate=1e-3,
+                 weight_decay=0.0,
                  device='cpu',
+                 **kwargs,
                  ):
 
         self.device = device
@@ -63,8 +66,8 @@ class PPO:
         # PPO components
         self.actor_critic = actor_critic
         self.actor_critic.to(self.device)
-        self.storage = None # initialized later
-        self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate)
+        self.storage = None # managed by runner
+        self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate, weight_decay=weight_decay)
         self.transition = RolloutStorage.Transition()
 
         # PPO parameters
@@ -73,71 +76,95 @@ class PPO:
         self.num_mini_batches = num_mini_batches
         self.value_loss_coef = value_loss_coef
         self.entropy_coef = entropy_coef
-        self.gamma = gamma
-        self.lam = lam
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
+        self.vel_predict_coef = vel_predict_coef
+        self.last_terrain_encoder_grad_norm = 0.0
+        self.last_diagnostics = {}
 
-    def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, history_dim, wm_feature_dim):
-        self.storage = RolloutStorage(num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, history_dim=history_dim,
-                                      wm_feature_dim = wm_feature_dim, device = self.device)
+    def init_storage(
+        self,
+        num_envs,
+        num_transitions_per_env,
+        actor_obs_shape,
+        critic_obs_shape,
+        action_shape,
+        history_dim=210,
+        wm_feature_dim=1536,
+    ):
+        self.storage = RolloutStorage(
+            num_envs,
+            num_transitions_per_env,
+            actor_obs_shape,
+            critic_obs_shape,
+            action_shape,
+            self.device,
+            history_dim=history_dim,
+            wm_feature_dim=wm_feature_dim,
+        )
 
     def test_mode(self):
-        self.actor_critic.test()
+        self.actor_critic.eval()
     
     def train_mode(self):
         self.actor_critic.train()
 
     def act(self, obs, critic_obs):
-        if self.actor_critic.is_recurrent:
-            self.transition.hidden_states = self.actor_critic.get_hidden_states()
-        # Compute the actions and values
-        self.transition.actions = self.actor_critic.act(obs).detach()
-        self.transition.values = self.actor_critic.evaluate(critic_obs).detach()
-        self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(self.transition.actions).detach()
-        self.transition.action_mean = self.actor_critic.action_mean.detach()
-        self.transition.action_sigma = self.actor_critic.action_std.detach()
-        # need to record obs and critic_obs before env.step()
-        self.transition.observations = obs
-        self.transition.critic_observations = critic_obs
-        return self.transition.actions
-    
-    def process_env_step(self, rewards, dones, infos):
-        self.transition.rewards = rewards.clone()
-        self.transition.dones = dones
-        # Bootstrapping on time outs
-        if 'time_outs' in infos:
-            self.transition.rewards += self.gamma * torch.squeeze(self.transition.values * infos['time_outs'].unsqueeze(1).to(self.device), 1)
+        # if self.actor_critic.is_recurrent:
+        #     self.transition.actions = self.actor_critic.act(obs, self.transition.rnn_states_a, self.transition.rnn_states_c).detach()
+        # else:
+        #     self.transition.actions = self.actor_critic.act(obs).detach()
+        # self.transition.values = self.actor_critic.evaluate(critic_obs).detach()
+        # self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(self.transition.actions).detach()
+        # self.transition.action_mean = self.actor_critic.action_mean.detach()
+        # self.transition.action_sigma = self.actor_critic.action_std.detach()
+        # need to handle this in runner as it's more complex for WMP
+        pass
 
-        # Record the transition
-        self.storage.add_transitions(self.transition)
-        self.transition.clear()
-        self.actor_critic.reset(dones)
-    
-    def compute_returns(self, last_critic_obs):
-        last_values= self.actor_critic.evaluate(last_critic_obs).detach()
-        self.storage.compute_returns(last_values, self.gamma, self.lam)
-
-    def update(self):
+    def update(self, clear_storage=True):
         mean_value_loss = 0
         mean_surrogate_loss = 0
+        mean_vel_predict_loss = 0
+        mean_feet_predict_loss = 0
+        mean_terrain_encoder_grad_norm = 0
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+
         for obs_batch, critic_obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
-            old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch in generator:
+            old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch, history_batch, wm_feature_batch in generator:
 
 
-                self.actor_critic.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+                terrain_embedding = self.actor_critic.encode_policy_observation(obs_batch)
+                critic_terrain_embedding = (
+                    self.actor_critic.encode_critic_observation(critic_obs_batch)
+                    if self.actor_critic.is_ame
+                    else terrain_embedding
+                )
+                self.actor_critic.act(
+                    obs_batch,
+                    history_batch,
+                    wm_feature_batch,
+                    terrain_embedding=terrain_embedding,
+                    masks=masks_batch,
+                    hidden_states=hid_states_batch[0],
+                )
                 actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
-                value_batch = self.actor_critic.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+                value_batch = self.actor_critic.evaluate(
+                    critic_obs_batch,
+                    wm_feature_batch,
+                    terrain_embedding=terrain_embedding,
+                    critic_terrain_embedding=critic_terrain_embedding,
+                    masks=masks_batch,
+                    hidden_states=hid_states_batch[1],
+                )
                 mu_batch = self.actor_critic.action_mean
                 sigma_batch = self.actor_critic.action_std
                 entropy_batch = self.actor_critic.entropy
 
                 # KL
-                if self.desired_kl != None and self.schedule == 'adaptive':
+                if self.desired_kl is not None and self.schedule == 'adaptive':
                     with torch.inference_mode():
                         kl = torch.sum(
                             torch.log(sigma_batch / old_sigma_batch + 1.e-5) + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch)) / (2.0 * torch.square(sigma_batch)) - 0.5, axis=-1)
@@ -159,7 +186,7 @@ class PPO:
                                                                                 1.0 + self.clip_param)
                 surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-                # Value function loss
+                # Value loss
                 if self.use_clipped_value_loss:
                     value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(-self.clip_param,
                                                                                                     self.clip_param)
@@ -171,18 +198,46 @@ class PPO:
 
                 loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
+                # MGDP-style auxiliary estimation loss: the 7-D estimation token
+                # (3-D lin vel + 4-D foot height) is supervised by the critic
+                # ground truths, which live in the first 7 dims of the critic obs.
+                if self.actor_critic.uses_estimation and self.vel_predict_coef > 0.0:
+                    est_token = self.actor_critic.estimation_token
+                    vel_loss = F.mse_loss(
+                        est_token[:, :3], critic_obs_batch[:, :3].detach()
+                    )
+                    feet_loss = F.mse_loss(
+                        est_token[:, 3:], critic_obs_batch[:, 3:7].detach()
+                    )
+                    loss = loss + self.vel_predict_coef * (vel_loss + feet_loss)
+                    mean_vel_predict_loss += vel_loss.item()
+                    mean_feet_predict_loss += feet_loss.item()
+
                 # Gradient step
                 self.optimizer.zero_grad()
                 loss.backward()
+                terrain_grad_norm = nn.utils.clip_grad_norm_(
+                    self.actor_critic.terrain_encoder.parameters(), float("inf")
+                )
                 nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
                 self.optimizer.step()
 
                 mean_value_loss += value_loss.item()
                 mean_surrogate_loss += surrogate_loss.item()
+                mean_terrain_encoder_grad_norm += terrain_grad_norm.item()
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
-        self.storage.clear()
+        mean_vel_predict_loss /= num_updates
+        mean_feet_predict_loss /= num_updates
+        self.last_terrain_encoder_grad_norm = mean_terrain_encoder_grad_norm / num_updates
+        self.last_diagnostics = {
+            "vel_predict_loss": mean_vel_predict_loss,
+            "feet_predict_loss": mean_feet_predict_loss,
+            "estimation_loss": mean_vel_predict_loss + mean_feet_predict_loss,
+        }
+        if clear_storage:
+            self.storage.clear()
 
         return mean_value_loss, mean_surrogate_loss

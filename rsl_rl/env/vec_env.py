@@ -55,6 +55,8 @@ class VecEnv(ABC):
     @abstractmethod
     def get_observations(self) -> torch.Tensor:
         pass
-    @abstractmethod
     def get_privileged_observations(self) -> Union[torch.Tensor, None]:
-        pass
+        obs = self.get_observations()
+        if hasattr(obs, "get"):
+            return obs.get("critic", None)
+        return getattr(self, "privileged_obs_buf", None)

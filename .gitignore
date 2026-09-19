@@ -1,0 +1,22 @@
+# C++
+**/cmake-build*/
+**/build*/
+**/*.so
+**/*.log*
+
+# Python
+.DS_Store
+**/*.egg-info/
+**/__pycache__/
+**/.pytest_cache/
+**/*.pyc
+**/*.pb
+
+# Outputs
+**/logs/*
+**/output/*
+**/outputs/*
+**/videos/*
+**/wandb/*
+**/.neptune/*
+*.tmp

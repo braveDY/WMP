@@ -51,6 +51,8 @@ class RSSM(nn.Module):
         num_actions=None,
         embed=None,
         device=None,
+        multi_step_length=0,
+        multi_step_shift=False,
     ):
         super(RSSM, self).__init__()
         self._stoch = stoch
@@ -67,6 +69,8 @@ class RSSM(nn.Module):
         self._num_actions = num_actions
         self._embed = embed
         self._device = device
+        self._multi_step_length = multi_step_length
+        self._multi_step_shift = multi_step_shift
 
         inp_layers = []
         if self._discrete:
@@ -119,23 +123,21 @@ class RSSM(nn.Module):
                 requires_grad=True,
             )
 
-    def initial(self, batch_size):
-        deter = torch.zeros(batch_size, self._deter).to(self._device)
+    def initial(self, batch_size, device=None):
+        # Use provided device or fallback to self._device
+        target_device = device if device is not None else self._device
+        deter = torch.zeros(batch_size, self._deter, device=target_device)
         if self._discrete:
             state = dict(
-                logit=torch.zeros([batch_size, self._stoch, self._discrete]).to(
-                    self._device
-                ),
-                stoch=torch.zeros([batch_size, self._stoch, self._discrete]).to(
-                    self._device
-                ),
+                logit=torch.zeros([batch_size, self._stoch, self._discrete], device=target_device),
+                stoch=torch.zeros([batch_size, self._stoch, self._discrete], device=target_device),
                 deter=deter,
             )
         else:
             state = dict(
-                mean=torch.zeros([batch_size, self._stoch]).to(self._device),
-                std=torch.zeros([batch_size, self._stoch]).to(self._device),
-                stoch=torch.zeros([batch_size, self._stoch]).to(self._device),
+                mean=torch.zeros([batch_size, self._stoch], device=target_device),
+                std=torch.zeros([batch_size, self._stoch], device=target_device),
+                stoch=torch.zeros([batch_size, self._stoch], device=target_device),
                 deter=deter,
             )
         if self._initial == "zeros":
@@ -147,7 +149,7 @@ class RSSM(nn.Module):
         else:
             raise NotImplementedError(self._initial)
 
-    def observe(self, embed, action, is_first, state=None):
+    def observe(self, embed, action, is_first, state=None, return_rollouts=False):
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
         # (batch, time, ch) -> (time, batch, ch)
         embed, action, is_first = swap(embed), swap(action), swap(is_first)
@@ -163,7 +165,31 @@ class RSSM(nn.Module):
         # (batch, time, stoch, discrete_num) -> (batch, time, stoch, discrete_num)
         post = {k: swap(v) for k, v in post.items()}
         prior = {k: swap(v) for k, v in prior.items()}
-        return post, prior
+        if not return_rollouts or self._multi_step_length <= 0:
+            return post, prior
+        return post, prior, self.multi_step_rollout(prior, swap(action))
+
+    def multi_step_rollout(self, prior, action):
+        horizon = self._multi_step_length
+        shift = int(bool(self._multi_step_shift))
+        valid_starts = action.shape[1] - horizon - shift + 1
+        if valid_starts <= 0:
+            return {
+                key: value[:, :0].unsqueeze(2).expand(
+                    value.shape[0], 0, horizon, *value.shape[2:]
+                )
+                for key, value in prior.items()
+            }
+
+        rollouts = []
+        for t in range(valid_starts):
+            start = {key: value[:, t] for key, value in prior.items()}
+            act = action[:, t + shift : t + shift + horizon]
+            rollouts.append(self.imagine_with_action(act, start))
+        return {
+            key: torch.stack([rollout[key] for rollout in rollouts], dim=1)
+            for key in prior.keys()
+        }
 
     def imagine_with_action(self, action, state):
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
@@ -231,6 +257,98 @@ class RSSM(nn.Module):
             stoch = self.get_dist(stats).mode()
         post = {"stoch": stoch, "deter": prior["deter"], **stats}
         return post, prior
+    
+    def obs_step_deter(self, prev_deter, prev_stoch, prev_action, embed, is_first): #推理使用的obs_step
+        """
+        Deterministic obs_step for TorchScript inference.
+        
+        Args:
+            prev_deter: Tensor [batch, deter_dim] - previous deterministic state
+            prev_stoch: Tensor [batch, stoch, discrete] or [batch, stoch] - previous stochastic state
+            prev_action: Tensor [batch, action_dim] - previous action  
+            embed: Tensor [batch, embed_dim] - encoded observation
+            is_first: Tensor [batch] - reset flag (1.0 = reset, 0.0 = continue)
+        
+        Returns:
+            wm_latent_dict: dict with "deter", "stoch", etc.
+            prior: dict (unused, return for compatibility)
+        """
+        batch_size = is_first.shape[0]
+
+        # Use embed.device for all tensors to ensure device consistency
+        target_device = embed.device
+        initial_state = self.initial(batch_size, device=target_device)
+        initial_deter = initial_state["deter"]  # [batch, deter]
+        initial_stoch = initial_state["stoch"]  # [batch, stoch, discrete] or [batch, stoch]
+        initial_action = torch.zeros(
+            (batch_size, self._num_actions),
+            device=target_device,
+            dtype=embed.dtype
+        )
+        
+        # === 用 torch.where 处理状态重置 (兼容 trace，无 Python if) ===
+        # 对于 deter: [batch] -> [batch, 1] -> expand to [batch, deter]
+        reset_mask_deter = is_first.unsqueeze(-1).expand_as(prev_deter)
+        new_prev_deter = torch.where(
+            reset_mask_deter.bool(),
+            initial_deter,
+            prev_deter
+        )
+        
+        # 对于 stoch: 需要根据维度处理
+        # prev_stoch 形状: discrete模式 [batch, stoch, discrete], 连续模式 [batch, stoch]
+        # 使用 reshape 来统一处理，避免 if 语句
+        # 将 is_first 扩展到与 prev_stoch 相同的形状
+        stoch_shape = prev_stoch.shape
+        # 创建与 stoch_shape 相同形状的 mask
+        # is_first: [batch] -> 扩展到 stoch_shape
+        reset_mask_stoch = is_first.view(-1, *([1] * (len(stoch_shape) - 1))).expand(stoch_shape)
+        new_prev_stoch = torch.where(
+            reset_mask_stoch.bool(),
+            initial_stoch,
+            prev_stoch
+        )
+        
+        # 对于 action: [batch] -> [batch, 1] -> expand to [batch, action]
+        action_mask = is_first.unsqueeze(-1).expand_as(prev_action)
+        new_prev_action = torch.where(
+            action_mask.bool(),
+            initial_action,
+            prev_action
+        )
+        
+        # === 构建临时 prev_state dict 供 img_step 使用 ===
+        # 注意: 这里的 if 语句在 trace 时会被固化，但由于 discrete 配置是固定的，所以行为正确
+        if self._discrete:
+            prev_state = {"stoch": new_prev_stoch, "deter": new_prev_deter}
+        else:
+            prev_state = {
+                "mean": torch.zeros(batch_size, self._stoch, device=target_device),
+                "std": torch.ones(batch_size, self._stoch, device=target_device),
+                "stoch": new_prev_stoch,
+                "deter": new_prev_deter
+            }
+        
+        # === 4. 计算 prior (img_step, sample=False 确定性) ===
+        prior = self.img_step(prev_state, new_prev_action, sample=False)
+        
+        # === 5. 计算 posterior (obs 路径) ===
+        x = torch.cat([prior["deter"], embed], -1)
+        x = self._obs_out_layers(x)
+        stats = self._suff_stats_layer("obs", x)
+        
+        # 使用 mode() 而非 sample() (确定性推理)
+        # 注意: 这里的 if 语句在 trace 时会被固化
+        if self._discrete:
+            stoch = self.get_dist(stats).mode()
+        else:
+            stoch = stats["mean"]  # mode = mean for normal dist
+        
+        # === 6. 构建输出字典 ===
+        wm_latent_dict = {"stoch": stoch, "deter": prior["deter"], **stats}
+        
+        return wm_latent_dict, prior
+
 
     def img_step(self, prev_state, prev_action, sample=True):
         # (batch, stoch, discrete_num)
@@ -331,16 +449,25 @@ class MultiEncoder(nn.Module):
         mlp_layers,
         mlp_units,
         symlog_inputs,
-        use_camera = False,
+        cross_attention=False,
+        cross_attention_prop_key="prop",
+        cross_attention_terrain_key="height_map",
+        cross_attention_dim=64,
+        cross_attention_heads=8,
+        cross_attention_cnn_downsample=True,
+        cross_attention_attach_global=False,
+        cross_attention_terrain_grid=None,
     ):
         super(MultiEncoder, self).__init__()
-        self.use_camera = use_camera
-        excluded = ("is_first", "is_last", "is_terminal", "reward",  "height_map")
+        excluded = ("is_first", "is_last", "is_terminal", "reward")
         shapes = {
             k: v
             for k, v in shapes.items()
             if k not in excluded and not k.startswith("log_")
         }
+        self._cross_attention = None
+        self._cross_attention_prop_key = cross_attention_prop_key
+        self._cross_attention_terrain_key = cross_attention_terrain_key
         self.cnn_shapes = {
             k: v for k, v in shapes.items() if len(v) == 3 and re.match(cnn_keys, k)
         }
@@ -349,6 +476,17 @@ class MultiEncoder(nn.Module):
             for k, v in shapes.items()
             if len(v) in (1, 2) and re.match(mlp_keys, k)
         }
+        if cross_attention:
+            self.cnn_shapes = {
+                k: v
+                for k, v in self.cnn_shapes.items()
+                if k not in (cross_attention_prop_key, cross_attention_terrain_key)
+            }
+            self.mlp_shapes = {
+                k: v
+                for k, v in self.mlp_shapes.items()
+                if k not in (cross_attention_prop_key, cross_attention_terrain_key)
+            }
         print("Encoder CNN shapes:", self.cnn_shapes)
         print("Encoder MLP shapes:", self.mlp_shapes)
 
@@ -375,22 +513,244 @@ class MultiEncoder(nn.Module):
             )
             self.outdim += mlp_units
             print('mlp outdim', mlp_units)
+        if cross_attention:
+            if cross_attention_prop_key not in shapes:
+                raise KeyError(
+                    f"Cross-attention proprio key '{cross_attention_prop_key}' not found in observation shapes."
+                )
+            if cross_attention_terrain_key not in shapes:
+                raise KeyError(
+                    f"Cross-attention terrain key '{cross_attention_terrain_key}' not found in observation shapes."
+                )
+            prop_shape = shapes[cross_attention_prop_key]
+            terrain_shape = shapes[cross_attention_terrain_key]
+            if len(prop_shape) not in (1, 2):
+                raise ValueError(
+                    f"Cross-attention proprio input must be vector-like, got {prop_shape}."
+                )
+            if len(terrain_shape) not in (1, 3):
+                raise ValueError(
+                    f"Cross-attention terrain input must be a flattened AME scan or image-like, got {terrain_shape}."
+                )
+            self._cross_attention = CrossAttentionTerrainEncoder(
+                prop_shape,
+                terrain_shape,
+                cross_attention_dim,
+                cross_attention_heads,
+                act,
+                norm,
+                cross_attention_cnn_downsample,
+                cross_attention_attach_global,
+                terrain_grid_shape=cross_attention_terrain_grid,
+            )
+            self.outdim += self._cross_attention.outdim
+            self.outdim += int(np.prod(prop_shape))
+            print('cross attention terrain outdim', self._cross_attention.outdim)
+            print('cross attention raw prop outdim', int(np.prod(prop_shape)))
 
         print('total outdim:', self.outdim)
 
     def forward(self, obs):
         outputs = []
         if self.cnn_shapes:
-            if(self.use_camera):
-                inputs = torch.cat([obs[k] for k in self.cnn_shapes], -1)
-                outputs.append(self._cnn(inputs))
-            else:
-                outputs.append(torch.zeros((obs["is_first"].shape + (self._cnn.outdim,)), device=obs["is_first"].device))
+            inputs = torch.cat([obs[k] for k in self.cnn_shapes], -1)
+            outputs.append(self._cnn(inputs))
         if self.mlp_shapes:
             inputs = torch.cat([obs[k] for k in self.mlp_shapes], -1)
             outputs.append(self._mlp(inputs))
+        if self._cross_attention is not None:
+            prop = obs[self._cross_attention_prop_key]
+            outputs.append(
+                self._cross_attention(
+                    prop,
+                    obs[self._cross_attention_terrain_key],
+                )
+            )
+            outputs.append(prop.reshape(list(prop.shape[:-len(self._cross_attention._prop_shape)]) + [-1]))
         outputs = torch.cat(outputs, -1)
         return outputs
+
+    def get_last_cross_attention_map(self, size=None):
+        if self._cross_attention is None:
+            return None
+        return self._cross_attention.get_last_attention_map(size=size)
+
+
+class CrossAttentionTerrainEncoder(nn.Module):
+    def __init__(
+        self,
+        prop_shape,
+        terrain_shape,
+        mha_dim=64,
+        num_heads=8,
+        act="SiLU",
+        norm=True,
+        cnn_downsample=True,
+        attach_global=False,
+        terrain_grid_shape=None,
+    ):
+        super(CrossAttentionTerrainEncoder, self).__init__()
+        if mha_dim % num_heads != 0:
+            raise ValueError(
+                f"cross_attention_dim ({mha_dim}) must be divisible by cross_attention_heads ({num_heads})."
+            )
+        act_name = act
+        self._prop_dim = int(np.prod(prop_shape))
+        self._prop_shape = tuple(prop_shape)
+        self._terrain_input_shape = tuple(terrain_shape)
+        self._mha_dim = mha_dim
+        self._cnn_downsample = cnn_downsample
+        self._attach_global = attach_global
+        self._coord_dim = 3
+        if mha_dim <= self._coord_dim:
+            raise ValueError(
+                f"cross_attention_dim ({mha_dim}) must be greater than coordinate dim ({self._coord_dim})."
+            )
+        self._cnn_output_dim = mha_dim - self._coord_dim
+        self.outdim = mha_dim + (mha_dim if attach_global else 0)
+
+        if len(self._terrain_input_shape) == 1:
+            if terrain_grid_shape is None:
+                raise ValueError(
+                    "cross_attention_terrain_grid is required for a flattened AME elevation map."
+                )
+            self._map_scan_dim = tuple(terrain_grid_shape)
+        else:
+            self._map_scan_dim = self._terrain_input_shape
+        if len(self._map_scan_dim) != 3:
+            raise ValueError(f"AME map_scan_dim must be (L, W, coord_dim), got {self._map_scan_dim}.")
+        self._map_length, self._map_width, input_ch = self._map_scan_dim
+        if input_ch != self._coord_dim:
+            raise ValueError(
+                f"Cross-attention terrain input must have 3 channels [x, y, height], got {self._map_scan_dim}."
+            )
+        expected_flat_dim = int(np.prod(self._map_scan_dim))
+        if len(self._terrain_input_shape) == 1 and self._terrain_input_shape[0] != expected_flat_dim:
+            raise ValueError(
+                f"Flattened elevation-map dim {self._terrain_input_shape[0]} does not match "
+                f"AME map_scan_dim={self._map_scan_dim} ({expected_flat_dim})."
+            )
+
+        # AME stores a flat (L, W, 3) scan but restores it as (W, L, 3)
+        # to preserve the GridPattern spatial ordering.
+        h, w = self._map_width, self._map_length
+        stride = 2 if cnn_downsample else 1
+        self._token_hw = (math.ceil(h / stride), math.ceil(w / stride))
+        self._token_count = self._token_hw[0] * self._token_hw[1]
+        self.last_attention_weights = None
+        self.map_cnn = nn.Sequential(
+            nn.Conv2d(
+                1,
+                16,
+                kernel_size=5,
+                padding=2,
+                stride=stride,
+                bias=False,
+                padding_mode="replicate",
+            ),
+            nn.ReLU(),
+            nn.GroupNorm(1, 16),
+            nn.Conv2d(
+                16,
+                self._cnn_output_dim,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+                padding_mode="replicate",
+            ),
+            nn.ReLU(),
+            nn.GroupNorm(1, self._cnn_output_dim),
+        )
+
+        self.proprio_embedding = nn.Linear(self._prop_dim, mha_dim)
+        if attach_global:
+            self.global_encoder = MLP(
+                mha_dim,
+                None,
+                2,
+                mha_dim,
+                act_name,
+                norm,
+                symlog_inputs=False,
+                name="CrossAttentionGlobal",
+            )
+            self.query_projector = nn.Linear(mha_dim * 2, mha_dim)
+        else:
+            self.global_encoder = None
+            self.query_projector = None
+
+        self.mha = nn.MultiheadAttention(
+            embed_dim=mha_dim, num_heads=num_heads, batch_first=True
+        )
+        print(
+            f"AME Cross Attention Terrain Encoder: flat_terrain={self._terrain_input_shape}, "
+            f"map_scan_dim={self._map_scan_dim}, prop_embedding_dim={self._prop_dim}, "
+            f"MHA dim={mha_dim}, heads={num_heads}, tokens={self._token_count}, "
+            f"terrain_cnn_channels=1, coord_concat=True"
+        )
+
+    def forward(self, prop, terrain):
+        leading_shape = prop.shape[:-len(self._prop_shape)]
+        terrain_leading_shape = terrain.shape[:-len(self._terrain_input_shape)]
+        if leading_shape != terrain_leading_shape:
+            raise ValueError(
+                f"Cross-attention inputs must share leading dimensions, got {leading_shape} and {terrain_leading_shape}."
+            )
+        prop = prop.reshape(-1, self._prop_dim)
+        terrain = terrain.reshape(
+            -1,
+            self._map_width,
+            self._map_length,
+            self._coord_dim,
+        )
+        height = terrain[..., 2:3].permute(0, 3, 1, 2)
+
+        cnn_features = self.map_cnn(height)
+        cnn_features = cnn_features.permute(0, 2, 3, 1).reshape(
+            terrain.shape[0], -1, self._cnn_output_dim
+        )
+        if self._cnn_downsample:
+            coords = terrain[:, ::2, ::2, : self._coord_dim]
+        else:
+            coords = terrain[..., : self._coord_dim]
+        coords = coords.reshape(terrain.shape[0], -1, self._coord_dim)
+        local_features = torch.cat([cnn_features, coords], dim=-1)
+        if local_features.shape[-1] != self._mha_dim:
+            raise RuntimeError(
+                f"Cross-attention local feature dim must equal {self._mha_dim}, got {local_features.shape[-1]}."
+            )
+        proprio_embedding = self.proprio_embedding(prop)
+        query_embedding = proprio_embedding
+
+        if self._attach_global:
+            global_features = self.global_encoder(local_features)
+            global_features_max, _ = torch.max(global_features, dim=1)
+            query_embedding = self.query_projector(
+                torch.cat([global_features_max, proprio_embedding], dim=-1)
+            )
+
+        mha_output, attention_weights = self.mha(
+            query=query_embedding.unsqueeze(1),
+            key=local_features,
+            value=local_features,
+        )
+        self.last_attention_weights = attention_weights.squeeze(1).reshape(
+            list(leading_shape) + list(self._token_hw)
+        ).detach()
+        output = mha_output.squeeze(1)
+        if self._attach_global:
+            output = torch.cat([global_features_max, output], dim=-1)
+        return output.reshape(list(leading_shape) + [self.outdim])
+
+    def get_last_attention_map(self, size=None):
+        if self.last_attention_weights is None:
+            return None
+        attention = self.last_attention_weights
+        if size is None or tuple(attention.shape[-2:]) == tuple(size):
+            return attention
+        flat = attention.reshape((-1, 1) + tuple(attention.shape[-2:]))
+        flat = F.interpolate(flat, size=size, mode="bilinear", align_corners=False)
+        return flat.reshape(list(attention.shape[:-2]) + list(size))
 
 
 class MultiDecoder(nn.Module):
@@ -411,11 +771,9 @@ class MultiDecoder(nn.Module):
         image_dist,
         vector_dist,
         outscale,
-        use_camera=False,
     ):
         super(MultiDecoder, self).__init__()
-        self.use_camera = use_camera
-        excluded = ("is_first", "is_last", "is_terminal", "height_map")
+        excluded = ("is_first", "is_last", "is_terminal")
         shapes = {k: v for k, v in shapes.items() if k not in excluded}
         self.cnn_shapes = {
             k: v for k, v in shapes.items() if len(v) == 3 and re.match(cnn_keys, k)
@@ -458,7 +816,7 @@ class MultiDecoder(nn.Module):
 
     def forward(self, features):
         dists = {}
-        if self.cnn_shapes and self.use_camera:
+        if self.cnn_shapes:
             feat = features
             outputs = self._cnn(feat)
             split_sizes = [v[-1] for v in self.cnn_shapes.values()]
@@ -522,7 +880,7 @@ class ConvEncoder(nn.Module):
         self.layers.apply(tools.weight_init)
 
     def forward(self, obs):
-        obs -= 0.5
+        # obs -= 0.5
         # (batch, time, h, w, ch) -> (batch * time, h, w, ch)
         x = obs.reshape((-1,) + tuple(obs.shape[-3:]))
         # (batch * time, h, w, ch) -> (batch * time, ch, h, w)
@@ -810,6 +1168,16 @@ class MLP(nn.Module):
         else:
             raise NotImplementedError(dist)
         return dist
+
+
+class Projector(nn.Module):
+    def __init__(self, inp_dim, out_dim):
+        super(Projector, self).__init__()
+        self.linear = nn.Linear(inp_dim, out_dim, bias=False)
+        self.apply(tools.weight_init)
+
+    def forward(self, x):
+        return self.linear(x)
 
 
 class GRUCell(nn.Module):

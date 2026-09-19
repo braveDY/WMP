@@ -764,11 +764,11 @@ class Optimizer:
         self._wd = wd
         self._wd_pattern = wd_pattern
         self._opt = {
-            "adam": lambda: torch.optim.Adam(parameters, lr=lr, eps=eps),
+            "adam": lambda: torch.optim.Adam(parameters, lr=float(lr), eps=float(eps)),
             "nadam": lambda: NotImplemented(f"{opt} is not implemented"),
-            "adamax": lambda: torch.optim.Adamax(parameters, lr=lr, eps=eps),
-            "sgd": lambda: torch.optim.SGD(parameters, lr=lr),
-            "momentum": lambda: torch.optim.SGD(parameters, lr=lr, momentum=0.9),
+            "adamax": lambda: torch.optim.Adamax(parameters, lr=float(lr), eps=float(eps)),
+            "sgd": lambda: torch.optim.SGD(parameters, lr=float(lr)),
+            "momentum": lambda: torch.optim.SGD(parameters,lr=float(lr), momentum=0.9),
         }[opt]()
         self._scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
